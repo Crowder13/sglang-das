@@ -1,8 +1,6 @@
 name: Nightly Test (DCU)
 
 on:
-  schedule:
-    - cron: "30 18 * * *" # 02:30 Beijing Time daily
   workflow_dispatch:
     inputs:
       ref:
