@@ -5,16 +5,6 @@ permissions:
   pull-requests: read
 
 on:
-  push:
-    branches:
-      - v0.5.12_dev
-    paths:
-      - 'python/**'
-      - 'sgl-kernel/**'
-      - 'sgl-model-gateway/**'
-      - 'requirements_dcu.txt'
-      - '.github/workflows/release-pypi-nightly-dcu.yml'
-
   workflow_call:
     inputs:
       ref:
