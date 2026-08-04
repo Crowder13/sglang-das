@@ -681,7 +681,9 @@ class MQALayer(MqaAttentionBase):
         )
 
         self.use_fused_qk_norm_rope = (
-            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+            _is_hip
+            and not _is_hcu
+            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
         # KV cache write is always fused into the K kernel
@@ -2107,14 +2109,17 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_cuda or (
+        # HCU retains the five-stream topology required by its dedicated DSV4
+        # CP/MegaMoE path; generic HIP keeps the official opt-in behavior.
+        use_stream_pool = _is_hcu or _is_cuda or (
             _is_hip
+            and not _is_hcu
             and (
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
         )
-        num_alt_streams = 5 if _is_cuda else 2
+        num_alt_streams = 5 if (_is_cuda or _is_hcu) else 2
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
