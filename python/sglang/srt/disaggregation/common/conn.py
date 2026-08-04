@@ -1620,6 +1620,8 @@ class CommonKVReceiver(BaseKVReceiver):
                     zmq.SNDTIMEO,
                     envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
                 )
+                # Bound the queued send backlog as well as individual sends.
+                sock.setsockopt(zmq.SNDHWM, 1000)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
