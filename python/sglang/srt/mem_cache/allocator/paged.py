@@ -252,9 +252,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
         if self.sglang_kvalloc_kernel:
+            # The HCU allocator ABI declares ``last_loc_ptr`` as int32_t*,
+            # while SWA translation can produce an int64 mapping tensor.
+            # Preserve the external ABI at this boundary: passing the int64
+            # storage through directly causes each request to read the high
+            # half of its predecessor's location.
+            last_loc_i32 = last_loc.to(dtype=torch.int32, copy=False)
             hcu_alloc_decode_kernel(
                 seq_lens_ptr = seq_lens,
-                last_loc_ptr = last_loc,
+                last_loc_ptr = last_loc_i32,
                 free_page_ptr = self.free_pages,
                 out_indices = out_indices,
                 bs = bs,
