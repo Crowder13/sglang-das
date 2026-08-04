@@ -62,6 +62,20 @@ _MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
 logger = logging.getLogger(__name__)
 
 
+def _disable_hcu_megamoe_asm_tail_reduce_default() -> None:
+    """Disable the standalone HCU ASM tail-reduce path before graph capture.
+
+    MegaMoE reads this environment flag while constructing its symmetric buffer;
+    setting it from the later CP dispatch selection is too late for decode graph
+    capture. An explicit user value retains precedence.
+    """
+    if not _IS_HCU:
+        return
+    if get_hcu_mega_moe_runtime() != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        return
+    os.environ.setdefault(_MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV, "0")
+
+
 def get_hcu_mega_moe_runtime() -> str:
     runtime = envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower()
     if runtime not in _HCU_MEGA_MOE_RUNTIMES:
@@ -70,6 +84,9 @@ def get_hcu_mega_moe_runtime() -> str:
             f"{sorted(_HCU_MEGA_MOE_RUNTIMES)}, got {runtime!r}"
         )
     return runtime
+
+
+_disable_hcu_megamoe_asm_tail_reduce_default()
 
 
 def _is_standalone_megamoe_runtime() -> bool:
