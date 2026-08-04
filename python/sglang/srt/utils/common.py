@@ -3553,7 +3553,12 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if server_args.dp_size == 1:
+            assert server_args.enable_prefill_cp, (
+                "dp_size must be greater than 1 unless DP-attention control "
+                "broadcast is used by context parallelism"
+            )
+            return False
         if server_args.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
