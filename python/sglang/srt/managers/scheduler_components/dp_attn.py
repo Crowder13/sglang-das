@@ -390,6 +390,14 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    # The scheduler supplies these callbacks for the PD decode StepInfo
+    # protocol.  The current elastic-DP all-gather owns the runtime transport;
+    # retaining the interface avoids coupling its constructor to the removed
+    # pre-refactor adapter implementation.
+    get_pd_decode_step_context: Callable[
+        [], Optional[tuple[torch.distributed.ProcessGroup, int, list[int]]]
+    ]
+    set_dp_scheduler_epoch: Callable[[int], None]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
