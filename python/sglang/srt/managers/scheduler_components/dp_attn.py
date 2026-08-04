@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+# Shared with the scheduler's PD decode StepInfo protocol.  Keep these module
+# constants available while the new elastic-DP implementation owns the payload.
+DP_DECODE_STEP_PROTOCOL_VERSION = 2
+DP_DECODE_STEP_BUILD_ID = 2026071602
+
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
