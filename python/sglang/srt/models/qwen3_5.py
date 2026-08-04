@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright 2025 Qwen Team
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -106,6 +109,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_npu,
     is_xpu,

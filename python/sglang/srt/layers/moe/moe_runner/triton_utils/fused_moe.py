@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
@@ -13,7 +16,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from lightop import get_moe_cuda_marlin_config, moe_gemm_marlin_w8a8_fp8
+from lightop.moe import get_moe_cuda_marlin_config, moe_gemm_marlin_w8a8_fp8
 
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
@@ -490,7 +493,7 @@ def _shape_str(tensor: Optional[torch.Tensor]) -> str:
     return "None" if tensor is None else str(tuple(tensor.shape))
 
 
-def _should_force_aiter_w4a16_moec(quant_type: Optional["MoeQuantType"]) -> bool:
+def _should_force_aiter_w4a16_moec(quant_type: Optional[MoeQuantType]) -> bool:
     if quant_type != MoeQuantType.W4A16:
         return False
 
@@ -623,9 +626,9 @@ def fused_experts_impl_aiter(
     force_w4a16_moec = _should_force_aiter_w4a16_moec(quant_type)
     status, moe_cfg = _get_aiter_moe_config_w4a16(config_kwargs, force_w4a16_moec)
     if status:
-        assert moe_cfg.solution_type is not None, (
-            "status=True but solution_type is None"
-        )
+        assert (
+            moe_cfg.solution_type is not None
+        ), "status=True but solution_type is None"
         assert moe_cfg.config is not None, "status=True but config is None"
         assert moe_cfg.solution_type in (
             MoeSolutionType.MOE_C,
@@ -643,9 +646,9 @@ def fused_experts_impl_aiter(
         #     f"config keys={list(moe_cfg.config.keys())}"
         # )
     else:
-        assert moe_cfg.solution_type is None, (
-            "status=False but solution_type is not None"
-        )
+        assert (
+            moe_cfg.solution_type is None
+        ), "status=False but solution_type is not None"
         assert moe_cfg.config is None, "status=False but config is not None"
         print(
             f"[get_config_aiter_moe] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_size}, dtype={hidden_states.dtype}, quant_type={quant_type} "
@@ -927,9 +930,9 @@ def _fused_moe_kernel_sequence(
                 if filter_expert:
                     swiglu_limit_for_triton = swiglu_limit
                 else:
-                    assert _is_cuda, (
-                        "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
-                    )
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2
@@ -1229,9 +1232,9 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
-            f"Hidden size mismatch"
-        )
+        assert (
+            hidden_states.shape[1] == w1.shape[2] - padded_size
+        ), f"Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1588,7 +1591,7 @@ def fused_moe_fp8_w8a8(
             topk,
             cuda_config1,
         )
-        from lightop import fuse_silu_mul_fp8_quant
+        from lightop.activation import fuse_silu_mul_fp8_quant
 
         fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
             intermediate_cache1, fp8type=0
@@ -1611,7 +1614,7 @@ def fused_moe_fp8_w8a8(
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
-        from lightop import op as ops  # 报错缺少ops
+        from lightop import moe as ops  # 报错缺少ops
 
         ops.moe_sum(
             intermediate_cache3,
