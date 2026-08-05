@@ -217,7 +217,8 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -1512,7 +1513,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
-            return y, post.squeeze(-1), comb, norm is not None
+            # The HCU compatibility path inside mhc_pre dispatches to AITER's
+            # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
+            # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
+            # contract so the caller still applies input_layernorm on HCU.
+            norm_fused = norm is not None and not (
+                _is_hcu and _use_aiter_tilelang_mhc
+            )
+            return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
             from aiter.ops.mhc import mhc_pre
@@ -1586,6 +1594,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+            # Keep the HCU implementation validated on v0.5.15.post1_dev.
+            # Generic ROCm/CUDA platforms use the upstream kernel below.
+            if _is_hcu and _use_aiter_tilelang_mhc:
+                from aiter.ops.tilelang import mhc_post_fwd
+
+                return mhc_post_fwd(x, residual, post, comb)
+
             from sglang.kernels.ops.layernorm.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
