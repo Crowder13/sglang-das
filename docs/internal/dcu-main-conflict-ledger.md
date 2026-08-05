@@ -2121,3 +2121,32 @@ actual result in the checkpoint note.
     workflow and does not block the daily merge.
   - No temporary trace probes were added. The staged branch remains suitable
     for commit; precision investigation is explicitly deferred.
+
+### 2026-08-05 — DSV4 HCU AITER MHC post and retired Q/RoPE flags
+
+- **Branch / area:** `forward-port/v0.5.15-post1-dev-20260804`,
+  `python/sglang/srt/models/deepseek_v4.py` (DSV4 MHC/Q-RoPE dispatch).
+- **Strategy:** manual merge / port to current API.  Keep HCU's validated
+  `aiter.ops.tilelang.mhc_post_fwd` behind `_is_hcu and
+  SGLANG_ROCM_USE_AITER_TILELANG_MHC`; generic platforms retain the upstream
+  `sglang.kernels.ops.layernorm.mhc.mhc_post` implementation.  `_use_aiter`
+  now matches `v0.5.15.post1_dev`: HIP but not HCU.
+- **Q/RoPE env audit:** `SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM` previously selected
+  the older HCU RMSNorm-plus-RoPE sequence.  `SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT`
+  was already only declared (no conditional call site) in the development
+  branch.  Official merge `ba31df0c0` replaced the former sequence with the
+  shared JIT `fused_q_norm_rope` path and removed both model consumers; retain
+  the `environ.py` registrations for launch-script compatibility, but do not
+  revive the obsolete implementation.
+- **Risk / validation:** static gate passed (`git ls-files -u` clean,
+  conflict-marker scan clean, `git diff --check`, and `py_compile`).  Earlier
+  HCU operator parity found `mhc_post_fwd` and generic MHC post bitwise equal
+  on representative BF16 shapes; the current `DeepseekV4DecoderLayer.hc_post`
+  HCU route also exactly matched direct `mhc_post_fwd` for `(12, 4, 4096)` and
+  produced only finite values. Earlier 10-question GSM8K was 10/10 on the
+  shared JIT Q/RoPE path. The 2026-08-05 full TP rerun passed imports and
+  distributed initialization but stopped before model load because HCU0
+  reported only 96.7 GiB available versus 138.8 GiB on the peer cards.  This
+  is an environment memory-balance failure, not an operator failure; all
+  launch-owned processes were terminated and `hy-smi` returned to 0% VRAM/HCU.
+- **Status:** `merged`; full TP retest requires a balanced eight-card host.
