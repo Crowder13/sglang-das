@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -35,6 +39,11 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+# Shared with the scheduler's PD decode StepInfo protocol.  Keep these module
+# constants available while the new elastic-DP implementation owns the payload.
+DP_DECODE_STEP_PROTOCOL_VERSION = 2
+DP_DECODE_STEP_BUILD_ID = 2026071602
 
 
 def _resolve_elastic_world_dp_size(
@@ -254,7 +263,14 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    # With a single DP replica and no residual attention-TP/MLP-TP gather,
+    # every CP rank receives the same work through the CP control broadcast.
+    # The scheduler metadata all-gather is therefore redundant and can hang
+    # on DCU CPU process groups during the idle loop.  Reuse the established
+    # skip path, which records each rank's local token count as required by CP.
+    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or (
+        dp_size == 1 and attn_tp_size == 1 and not require_mlp_tp_gather
+    )
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -374,6 +390,14 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    # The scheduler supplies these callbacks for the PD decode StepInfo
+    # protocol.  The current elastic-DP all-gather owns the runtime transport;
+    # retaining the interface avoids coupling its constructor to the removed
+    # pre-refactor adapter implementation.
+    get_pd_decode_step_context: Callable[
+        [], Optional[tuple[torch.distributed.ProcessGroup, int, list[int]]]
+    ]
+    set_dp_scheduler_epoch: Callable[[int], None]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(

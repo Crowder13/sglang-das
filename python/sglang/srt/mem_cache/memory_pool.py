@@ -92,7 +92,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
-    
+
 from sglang.srt.utils import get_bool_env_var
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
@@ -2224,7 +2224,7 @@ class MHATokenToKVPool(KVCache):
                 else:
                     k_chunk = self.k_buffer[layer_id][chunk_indices]
                     v_chunk = self.v_buffer[layer_id][chunk_indices]
-                
+
                 k_cpu = k_chunk.to("cpu", non_blocking=True)
                 v_cpu = v_chunk.to("cpu", non_blocking=True)
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
@@ -4041,7 +4041,7 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
-    
+
     def set_kv_buffer_opt(  # TODO: handwrite kernel
         self,
         layer: RadixAttention,
@@ -4060,7 +4060,7 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
-        
+
 
     def _write_mla_kv_buffer(
         self,

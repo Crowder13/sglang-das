@@ -621,3 +621,16 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
+    """Return the DeepGEMM INT8 unique-token policy for the PD topology."""
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        mode = get_global_server_args().disaggregation_mode
+        if mode in ("prefill", "decode"):
+            return 0, mode
+    except Exception:
+        pass
+    return 1, "ifb"

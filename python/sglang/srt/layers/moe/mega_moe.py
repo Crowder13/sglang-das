@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,8 +60,23 @@ _MEGA_MOE_HCU_BACKEND_LL = "ll"
 _MEGA_MOE_HCU_BACKEND_NORMAL = "normal"
 _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD"
 _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD = 496
+_MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
 
 logger = logging.getLogger(__name__)
+
+
+def _disable_hcu_megamoe_asm_tail_reduce_default() -> None:
+    """Disable the standalone HCU ASM tail-reduce path before graph capture.
+
+    MegaMoE reads this environment flag while constructing its symmetric buffer;
+    setting it from the later CP dispatch selection is too late for decode graph
+    capture. An explicit user value retains precedence.
+    """
+    if not _IS_HCU:
+        return
+    if get_hcu_mega_moe_runtime() != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        return
+    os.environ.setdefault(_MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV, "0")
 
 
 def get_hcu_mega_moe_runtime() -> str:
@@ -69,6 +87,9 @@ def get_hcu_mega_moe_runtime() -> str:
             f"{sorted(_HCU_MEGA_MOE_RUNTIMES)}, got {runtime!r}"
         )
     return runtime
+
+
+_disable_hcu_megamoe_asm_tail_reduce_default()
 
 
 def _is_standalone_megamoe_runtime() -> bool:
@@ -112,12 +133,18 @@ def _get_hcu_normal_ll_token_threshold() -> int:
 def _select_hcu_megamoe_backend(selector_tokens: int) -> str:
     if selector_tokens < 0:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
+    if is_dsa_enable_prefill_cp():
+        # CP prefill uses rank barriers and local reduction. The standalone
+        # HCU LL/tail-reduce path can VMFault under sustained CP traffic.
+        os.environ.setdefault(_MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV, "0")
     if _is_pd_prefill_instance():
         return _MEGA_MOE_HCU_BACKEND_NORMAL
 
     mode = os.environ.get(_MEGA_MOE_HCU_BACKEND_ENV, _MEGA_MOE_HCU_BACKEND_AUTO)
     mode = mode.strip().lower()
     if mode == _MEGA_MOE_HCU_BACKEND_AUTO:
+        if is_dsa_enable_prefill_cp():
+            return _MEGA_MOE_HCU_BACKEND_NORMAL
         return (
             _MEGA_MOE_HCU_BACKEND_LL
             if selector_tokens <= _get_hcu_normal_ll_token_threshold()
@@ -158,11 +185,9 @@ def _get_hcu_w8a8_pre_dispatch_quant():
         return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
     try:
-        from lightop import op as lightop_op
+        from lightop.quant import per_token_quant_fp8
 
-        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = getattr(
-            lightop_op, "per_token_quant_fp8", None
-        )
+        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = per_token_quant_fp8
     except Exception as exc:
         logger.warning(
             "lightop per-token FP8 quantization is unavailable; falling back "
@@ -188,7 +213,12 @@ def _prepare_standalone_megamoe_inputs(
             if hidden_states.is_contiguous()
             else hidden_states.contiguous()
         )
-        quant(buf.x[:num_tokens], quant_input, buf.x_sf[:num_tokens])
+        quant(
+            quant_input,
+            dtype=buf.x.dtype,
+            out_q=buf.x[:num_tokens],
+            out_scale=buf.x_sf[:num_tokens],
+        )
     else:
         import megamoe
 

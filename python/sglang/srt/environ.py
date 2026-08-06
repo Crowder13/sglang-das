@@ -402,6 +402,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # DeepSeek-V4 only needs the SWA tail during PD prefill/decode transfer.
+    # Set to false to restore the legacy admission cap based on the SWA pool.
+    SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -427,6 +430,11 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    # Optional: with DP-attention, send control messages to every DP group
+    # leader and broadcast within attn_tp/cp group instead of full tp_group.
+    # Prefer this over --enable-dp-attention-local-control-broadcast so PD+DP
+    # workloads are not forced to flip a global CLI flag.
+    SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
@@ -634,7 +642,6 @@ class Envs:
     SGLANG_USE_FUSED_TOPK_SOFTMAX = EnvBool(False)
     SGLANG_USE_FUSED_RESHAPE_TO_FLOAT = EnvBool(False)
     SGLANG_USE_AITER_LINEAR_ATTN = EnvBool(False)
-
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
