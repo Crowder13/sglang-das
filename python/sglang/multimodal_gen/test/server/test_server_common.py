@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 """
 Config-driven diffusion generation test with pytest parametrization.
 
@@ -66,6 +70,7 @@ from sglang.multimodal_gen.test.test_utils import (
     save_consistency_failure_artifact,
     wait_for_req_perf_record,
 )
+from sglang.srt.utils import is_hcu
 
 logger = init_logger(__name__)
 
@@ -113,10 +118,16 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         and server_args.ring_degree is not None
         and server_args.ring_degree > 1
     ):
-        pytest.skip(
-            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
-            "requires Flash Attention which is not available on AMD/ROCm"
-        )
+        if is_hcu():
+            pytest.skip(
+                f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+                "requires Flash Attention which is not available on HCU/ROCm"
+            )
+        else:
+            pytest.skip(
+                f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+                "requires Flash Attention which is not available on AMD/ROCm"
+            )
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))

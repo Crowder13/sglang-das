@@ -217,7 +217,8 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -313,6 +314,25 @@ def _freqs_cis_to_cos_sin(
     sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
+
+
+_fused_qnorm_rope_cos_sin_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+    key = (
+        freqs_cis.device.type,
+        freqs_cis.device.index,
+        freqs_cis.data_ptr(),
+    )
+    cache = _fused_qnorm_rope_cos_sin_cache.get(key)
+    if cache is None:
+        freqs_real = torch.view_as_real(freqs_cis)  # [max_pos, 32, 2]
+        cache = torch.cat(
+            [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
+        ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
+        _fused_qnorm_rope_cos_sin_cache[key] = cache
+    return cache
 
 
 if TYPE_CHECKING:
@@ -681,7 +701,9 @@ class MQALayer(MqaAttentionBase):
         )
 
         self.use_fused_qk_norm_rope = (
-            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+            _is_hip
+            and not _is_hcu
+            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
         # KV cache write is always fused into the K kernel
@@ -1491,7 +1513,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
-            return y, post.squeeze(-1), comb, norm is not None
+            # The HCU compatibility path inside mhc_pre dispatches to AITER's
+            # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
+            # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
+            # contract so the caller still applies input_layernorm on HCU.
+            norm_fused = norm is not None and not (
+                _is_hcu and _use_aiter_tilelang_mhc
+            )
+            return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
             from aiter.ops.mhc import mhc_pre
@@ -1565,6 +1594,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+            # Keep the HCU implementation validated on v0.5.15.post1_dev.
+            # Generic ROCm/CUDA platforms use the upstream kernel below.
+            if _is_hcu and _use_aiter_tilelang_mhc:
+                from aiter.ops.tilelang import mhc_post_fwd
+
+                return mhc_post_fwd(x, residual, post, comb)
+
             from sglang.kernels.ops.layernorm.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
@@ -2107,14 +2143,17 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_cuda or (
+        # HCU retains the five-stream topology required by its dedicated DSV4
+        # CP/MegaMoE path; generic HIP keeps the official opt-in behavior.
+        use_stream_pool = _is_hcu or _is_cuda or (
             _is_hip
+            and not _is_hcu
             and (
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
         )
-        num_alt_streams = 5 if _is_cuda else 2
+        num_alt_streams = 5 if (_is_cuda or _is_hcu) else 2
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
@@ -2396,21 +2435,34 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
-
+        if not self.pp_group.is_last_rank:
+            # Flatten 3D mHC tensor for PP IPC.
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+        need_pre_hc_head = getattr(
+            forward_batch, "return_hidden_states_before_norm", False
+        )
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
+            pre_hc_head = None
+            if need_pre_hc_head:
+                pre_hc_head = cp_all_gather_rerange_output(
+                    hidden_states.flatten(1),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
+            hidden_states = self.norm(hidden_states)
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-
-        if not self.pp_group.is_last_rank:
-            # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
-
-        pre_hc_head = hidden_states.flatten(1)
+            return hidden_states, pre_hc_head
+        pre_hc_head = hidden_states.flatten(1) if need_pre_hc_head else None
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base

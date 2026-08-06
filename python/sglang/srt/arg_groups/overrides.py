@@ -1988,7 +1988,13 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1 and view.ep_join_mode != "scale":
+    # Prefill CP uses the DP-attention control plane even with one data-parallel
+    # replica, so do not overwrite the model hook's explicit enablement.
+    if (
+        view.dp_size == 1
+        and view.ep_join_mode != "scale"
+        and not view.enable_prefill_cp
+    ):
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 
