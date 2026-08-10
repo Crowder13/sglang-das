@@ -40,6 +40,10 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.moe import (  # should_use_flashinfer_trtllm_moe, # 找不到
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -58,7 +62,11 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPLLCombineInput,
     MoriEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import _get_deepgemm_shuffle_unique
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -76,6 +84,12 @@ from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
     SlimQuantW4A8Int8MarlinConfig,
 )
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -525,11 +539,25 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend().is_deep_gemm()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
+            # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
+            self.deprecate_flag = True
+        elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
-            and get_moe_a2a_backend().is_deepep()
-            and get_deepep_mode().enable_low_latency()
+            and (
+                (
+                    get_moe_a2a_backend().is_deepep()
+                    and get_deepep_mode().enable_low_latency()
+                )
+                or get_moe_a2a_backend().is_pplx()
+            )
             and not _is_npu
             and not _is_hip
         ):
@@ -650,6 +678,43 @@ class DeepEPMoE(FusedMoE):
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
 
+    def _a2a_forward_with_output_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # eager run under breakable cuda graph
+        saved_is_extend_in_batch = get_is_extend_in_batch()
+        set_is_extend_in_batch(True)
+        try:
+            output.copy_(
+                self.forward_impl(
+                    hidden_states,
+                    StandardTopKOutput(topk_weights, topk_ids, router_logits),
+                )
+            )
+        finally:
+            set_is_extend_in_batch(saved_is_extend_in_batch)
+
+    def _a2a_forward_capture_stub(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Capture pass only: record the buffer address, skip the
+        # rank-coupled a2a. Warmup and replay run the real body.
+        output.zero_()
+
+    a2a_forward_with_output = eager_on_graph(
+        True, capture_stub=_a2a_forward_capture_stub
+    )(_a2a_forward_with_output_impl)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -657,6 +722,20 @@ class DeepEPMoE(FusedMoE):
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
     ):
+        # DeepEP NORMAL mode is not capturable; run it as an eager node.
+        if is_in_breakable_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for breakable cuda graph"
+            output = torch.empty_like(hidden_states)
+            self.a2a_forward_with_output(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                output,
+            )
+            return output
         if is_in_tc_piecewise_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
@@ -1543,7 +1622,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_normal(
             layer=self,
@@ -1813,7 +1892,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_ll(
             layer=self,
@@ -2335,6 +2414,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         get_moe_a2a_backend().is_deepep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
+        or get_moe_a2a_backend().is_pplx()
     ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():

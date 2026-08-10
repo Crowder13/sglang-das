@@ -71,16 +71,17 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+)
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_lightop,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -578,9 +579,7 @@ class DeepseekV4AttnBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens: int = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         if self.speculative_num_draft_tokens is not None:
             # Persistent target-verify metadata buffers. Allocated here (not
             # lazily) so they are ordinary tensors: the first touch of a lazy
@@ -613,7 +612,7 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1551,20 +1550,20 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
-        if self.speculative_num_draft_tokens and not self.is_draft_runner:
-            # DSV4's verify metadata ignores custom_mask, but handing
-            # build_tree a preallocated scratch keeps it from dynamically
-            # allocating a FULL_MASK buffer (bs * max_context_len under the
-            # GPU-only spec path) every verify step.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens
-                * (self.max_context_len + self.speculative_num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        # Verify metadata never extracts the mask. No skip_prefill notion here.
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=False,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def replay_cuda_graph_metadata_from(
         self,
@@ -2095,6 +2094,8 @@ class DeepseekV4AttnBackend(
                 from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
             except ImportError:
                 from flash_mla import flash_mla_sparse_fwd
+        elif _is_xpu:
+            from sgl_kernel import flash_mla_sparse_fwd
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 

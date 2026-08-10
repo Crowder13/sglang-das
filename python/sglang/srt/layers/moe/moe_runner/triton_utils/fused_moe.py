@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
@@ -163,6 +163,7 @@ def inplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> None:
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
@@ -197,6 +198,7 @@ def inplace_fused_experts(
         filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 
@@ -270,6 +272,7 @@ def outplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
@@ -304,6 +307,7 @@ def outplace_fused_experts(
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 
@@ -367,6 +371,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    a1_q: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -415,6 +420,7 @@ def fused_experts(
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
         )
         return hidden_states
     else:
@@ -448,6 +454,7 @@ def fused_experts(
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
         )
 
 
@@ -788,12 +795,19 @@ def _fused_moe_kernel_sequence(
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
     Inputs are already aligned and the block-size config is already resolved.
     Supports optional LoRA hooks that fire between the two kernels and before
     combine. Returns ``out_hidden_states``.
+
+    ``a1_q`` (SGLANG_OPT_MOE_QUANT_ONCE): optional pre-quantized fp8 view of
+    ``hidden_states`` for the gate-up GEMM (per-token-group ``block_shape[1]``
+    quant, ``a1_scale`` holds the matching scales, rows may exceed
+    ``num_tokens`` due to 4-row padding). ``hidden_states`` stays bf16 and is
+    still used for output dtype/shape and the inplace combine.
     """
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
@@ -805,6 +819,17 @@ def _fused_moe_kernel_sequence(
     # is incompatible with the hook contract.
     if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
         down_moe_use_tma = False
+
+    if a1_q is not None:
+        assert (
+            use_fp8_w8a8
+            and block_shape is not None
+            and a1_scale is not None
+            and a1_q.dtype == torch.float8_e4m3fn
+            and a1_q.is_contiguous()
+            and a1_q.shape[0] >= num_tokens
+            and a1_q.shape[1] == hidden_states.shape[1]
+        ), "a1_q requires block-wise fp8 with matching pre-quantized activation"
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -833,7 +858,7 @@ def _fused_moe_kernel_sequence(
             out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_server_args().enable_fused_moe_sum_all_reduce
+        get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -847,7 +872,7 @@ def _fused_moe_kernel_sequence(
     )
 
     invoke_fused_moe_kernel(
-        hidden_states,
+        a1_q if a1_q is not None else hidden_states,
         w1,
         b1,
         intermediate_cache1,
@@ -987,6 +1012,17 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+    elif activation == "situ" and is_gated:
+        d = N // 2
+        x = intermediate_cache1.view(-1, N)
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
+        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        situ_linear_beta = gemm1_limit
+        if situ_linear_beta is not None:
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -1193,6 +1229,7 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ):
     if (
         _use_aiter_moe
@@ -1299,6 +1336,7 @@ def fused_experts_impl(
         hooks=None,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 

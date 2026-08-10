@@ -42,7 +42,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1702,6 +1702,7 @@ class RowParallelLinear(LinearBase):
         forward_batch=None,
         use_fused_silu_mul_quant: Optional[bool] = False,
         use_fused_silu_mul_fp8_quant: Optional[bool] = False,
+        output_tensor=None,
     ):
         if self.input_is_parallel:
             input_parallel = input_
@@ -1753,9 +1754,20 @@ class RowParallelLinear(LinearBase):
                     sm.tag(output_parallel)
         else:
             with symm_ctx:
-                output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias=bias_
-                )
+                if output_tensor is None:
+                    output_parallel = self.quant_method.apply(
+                        self, input_parallel, bias=bias_
+                    )
+                else:
+                    apply_into = getattr(self.quant_method, "apply_into", None)
+                    if apply_into is None:
+                        raise RuntimeError(
+                            f"{type(self.quant_method).__name__} cannot write into "
+                            "caller-owned linear output"
+                        )
+                    output_parallel = apply_into(
+                        self, input_parallel, output_tensor, bias=bias_
+                    )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
@@ -1771,7 +1783,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_server_args().enable_quant_communications
+                        and get_exec().comm.enable_quant_communications
                     )
                     if forward_batch is not None
                     else False

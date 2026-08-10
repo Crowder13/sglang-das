@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.utils import is_hcu, is_hip
-from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
+from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
 
 _is_hip = is_hip()
 _is_hcu = is_hcu()
@@ -184,7 +184,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.dequantization_config = dequantization_config
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not mxfp_supported():
+            if not is_gfx95_supported():
                 if _is_hcu:
                     raise NotImplementedError(
                         "Online MXFP4 quantization requires an HCU/ROCm device with "

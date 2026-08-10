@@ -30,8 +30,13 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp8_mega_moe_available,
+    run_sm90_mega_routed,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
@@ -326,6 +331,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
                 f"built={built_runtime!r}, current={runtime!r}. Restart the "
                 "server after changing SGLANG_HCU_MEGA_MOE_RUNTIME."
             )
+    elif _device_sm == 90:
+        if not is_sm90_fp8_mega_moe_available(moe.experts):
+            return False
     if get_is_capture_mode():
         return not _IS_HCU or _is_standalone_megamoe_runtime()
 
@@ -481,6 +489,16 @@ def _run_mega_routed(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    if _device_sm == 90:
+        return run_sm90_mega_routed(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+        )
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
