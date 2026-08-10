@@ -50,6 +50,8 @@ cudaOccupancyAvailableDynamicSMemPerBlock(std::size_t* smem, const void* func, i
 #endif
 #endif
 
+namespace sglang {
+
 namespace host::runtime {
 
 // Return the maximum number of active blocks per SM for the given kernel
@@ -103,3 +105,5 @@ inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int
 }
 
 }  // namespace host::runtime
+
+}  // namespace sglang

@@ -9,6 +9,8 @@
 
 #include <dlpack/dlpack.h>
 
+namespace sglang {
+
 namespace host::compress {
 
 using PlanResult = tvm::ffi::Tuple<uint32_t, uint32_t>;
@@ -207,9 +209,7 @@ inline PlanResult plan_prefill(
 
 }  // namespace host::compress
 
-namespace {
-
 [[maybe_unused]]
 constexpr auto& plan_compress_prefill = host::compress::plan_prefill;
 
-}  // namespace
+}  // namespace sglang

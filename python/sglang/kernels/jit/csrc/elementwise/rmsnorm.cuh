@@ -14,7 +14,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 struct RMSNormParams {
   const void* input;
@@ -372,4 +372,4 @@ struct RMSNormHalfKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -19,7 +19,7 @@
 #include <bit>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
@@ -886,4 +886,4 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -55,13 +55,12 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_hip,
+    is_gfx95_supported,
     is_mps,
     is_npu,
-    mxfp_supported,
 )
 
-_is_mxfp_supported = mxfp_supported()
+_is_gfx95_supported = is_gfx95_supported()
 
 
 # Base quantization methods
@@ -101,7 +100,7 @@ if QuarkConfig is not None:
     BASE_QUANTIZATION_METHODS["quark"] = QuarkConfig
     BASE_QUANTIZATION_METHODS["quark_mxfp4"] = QuarkConfig
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or _is_gfx95_supported:
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

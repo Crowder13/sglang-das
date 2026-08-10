@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using Plan4 = device::compress::PrefillPlan;
 using IndiceT = int32_t;
@@ -550,4 +550,4 @@ struct FlashCompress4Kernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
