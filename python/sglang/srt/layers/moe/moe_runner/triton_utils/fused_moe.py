@@ -31,6 +31,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.hcu_dspark_aiter_moe_fallback import (
+    is_triton_forced_for_dspark_aiter_fallback,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.runtime_context import get_exec, get_server_args
@@ -1233,6 +1236,7 @@ def fused_experts_impl(
 ):
     if (
         _use_aiter_moe
+        and not is_triton_forced_for_dspark_aiter_fallback()
         and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8)
         and hidden_states.dtype == torch.bfloat16
     ):

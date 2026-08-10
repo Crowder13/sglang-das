@@ -156,6 +156,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
+        # mHC target models (for example DSV4-Flash with hc_mult > 1) feed the
+        # draft model a recurrent hidden state wider than the ordinary hidden
+        # size. Preserve the pre-hc-head state throughout the EAGLE pipeline.
+        self.need_hidden_states_before_norm = (
+            getattr(target_worker.model_runner.model_config, "hc_hidden_size", None)
+            is not None
+        )
 
         # Args for easy access
         self.device = server_args.device
@@ -786,7 +793,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             batch,
             self.draft_runner,
             capture_hidden_mode=capture_hidden_mode,
-            return_hidden_states_before_norm=False,
+            return_hidden_states_before_norm=self.need_hidden_states_before_norm,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -900,7 +907,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
-                return_hidden_states_before_norm=False,
+                return_hidden_states_before_norm=self.need_hidden_states_before_norm,
             )
 
         if self.plan_stream:
@@ -1034,6 +1041,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
+        self.need_hidden_states_before_norm = (
+            getattr(target_worker.model_runner.model_config, "hc_hidden_size", None)
+            is not None
+        )
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -1122,7 +1133,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                capture_hidden_mode=target_capture_mode,
+                return_hidden_states_before_norm=self.need_hidden_states_before_norm,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
