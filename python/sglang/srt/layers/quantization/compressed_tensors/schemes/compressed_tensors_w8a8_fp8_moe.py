@@ -710,10 +710,29 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 use_shuffle=_use_shuffle,
             )
             if not status:
+                from sglang.srt.layers.moe.hcu_dspark_aiter_moe_fallback import (
+                    try_run_dspark_aiter_moe_triton_fallback,
+                )
+
+                fallback_output = try_run_dspark_aiter_moe_triton_fallback(
+                    runner=self.runner,
+                    dispatch_output=dispatch_output,
+                    layer=layer,
+                    M=M,
+                    N1=N1,
+                    N2=N2,
+                    K=K,
+                    E=E,
+                    top_k=top_k,
+                    use_shuffle=_use_shuffle,
+                )
+                if fallback_output is not None:
+                    return fallback_output
                 raise RuntimeError(
-                "[aiter_moe_fp8_w8a8] no suitable backend found: "
-                f"M={M}, N1={N1}, N2={N2}, K={K}, "
-                f"E={E}, topk={top_k}")
+                    "[aiter_moe_fp8_w8a8] no suitable backend found: "
+                    f"M={M}, N1={N1}, N2={N2}, K={K}, "
+                    f"E={E}, topk={top_k}"
+                )
             if moe_cfg.solution_type not in {
                 MoeSolutionType.MOE_C,
                 MoeSolutionType.ASM,
