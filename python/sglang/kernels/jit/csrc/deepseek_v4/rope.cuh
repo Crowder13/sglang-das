@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using DType = bf16_t;
 constexpr int64_t kRopeDim = 64;
@@ -182,4 +182,4 @@ struct FusedQKRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

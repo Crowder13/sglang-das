@@ -15,6 +15,7 @@ from itertools import chain
 from typing import Any
 
 import torch
+import torch.distributed.tensor as dist_tensor
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed._tensor import distribute_tensor
@@ -23,6 +24,7 @@ from torch.distributed.fsdp import (
     FSDPModule,
     MixedPrecisionPolicy,
     fully_shard,
+    register_fsdp_forward_method,
 )
 from torch.nn.modules.module import _IncompatibleKeys
 
@@ -33,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     build_bitsandbytes_4bit_quant_states,
     split_bitsandbytes_4bit_state,
 )
+from sglang.multimodal_gen.runtime.loader import rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
@@ -225,7 +228,8 @@ def maybe_load_fsdp_model(
     Args:
         param_dtype: Data type for model parameters, also used for:
             - Model initialization context (set_default_torch_dtype)
-            - FSDP mixed precision policy
+            - FSDP mixed precision policy unless the model preserves mixed
+              original parameter dtypes
             - Weight loading and casting
         reduce_dtype: Data type for gradient reduction in FSDP mixed precision.
         strict: If True, enforce strict state dict loading (all keys must match).
@@ -236,8 +240,19 @@ def maybe_load_fsdp_model(
 
     # 1. prepare for loading
     default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
+    # Some native models deliberately mix FP32 projections with lower-precision
+    # blocks.  FSDP must all-gather those parameters in their original dtypes;
+    # the thread-local compute dtype below remains the requested default.
+    fsdp_param_dtype = (
+        None
+        if fsdp_inference and getattr(model_cls, "_fsdp_mixed_dtype_params", False)
+        else default_torch_dtype
+    )
     mp_policy = MixedPrecisionPolicy(
-        default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
+        param_dtype=fsdp_param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        cast_forward_inputs=False,
     )
 
     set_mixed_precision_policy(
@@ -300,19 +315,23 @@ def maybe_load_fsdp_model(
             fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
             pin_cpu_memory=pin_cpu_memory,
         )
+        if callable(getattr(model, "refine_prompt_embeds", None)):
+            register_fsdp_forward_method(model, "refine_prompt_embeds")
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
     # 2. load model from disk
-    weight_iterator = safetensors_weights_iterator(
-        weight_dir_list, use_runai_model_streamer=not streaming_state_dict_load
-    )
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
-    if preprocess_loaded_state_dict is not None:
-        weight_iterator = preprocess_loaded_state_dict(weight_iterator)
-
+    bnb_quant_states = None
+    preconverted_state_dict = None
+    is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
     if streaming_state_dict_load:
         logger.info("Loading model weights with streaming state-dict load")
+        weight_iterator = safetensors_weights_iterator(
+            weight_dir_list, use_runai_model_streamer=False
+        )
+        if preprocess_loaded_state_dict is not None:
+            weight_iterator = preprocess_loaded_state_dict(weight_iterator)
         load_model_from_streaming_state_dict(
             model,
             weight_iterator,
@@ -323,18 +342,51 @@ def maybe_load_fsdp_model(
             param_names_mapping=param_names_mapping_fn,
         )
     else:
-        bnb_quant_states = None
-        if _is_bitsandbytes_quant_config(init_params.get("quant_config")):
-            normal_weights, raw_quant_state = split_bitsandbytes_4bit_state(
-                weight_iterator
+        if (
+            use_fsdp
+            and weight_dir_list
+            and preprocess_loaded_state_dict is None
+            and not is_bnb_quantized
+        ):
+            preconverted_state_dict = (
+                rank_local_checkpoint.try_load_rank_local_fsdp_state_dict(
+                    model,
+                    weight_dir_list,
+                    param_names_mapping_fn,
+                )
             )
-            bnb_quant_states = build_bitsandbytes_4bit_quant_states(
-                [name for name, _ in normal_weights],
-                raw_quant_state,
-                device,
-                param_names_mapping_fn,
+        elif (
+            not use_fsdp
+            and weight_dir_list
+            and preprocess_loaded_state_dict is None
+            and not is_bnb_quantized
+        ):
+            preconverted_state_dict = (
+                rank_local_checkpoint.try_load_rank_local_tp_state_dict(
+                    model,
+                    weight_dir_list,
+                    param_names_mapping_fn,
+                )
             )
-            weight_iterator = iter(normal_weights)
+
+        if preconverted_state_dict is None:
+            weight_iterator = safetensors_weights_iterator(weight_dir_list)
+            if preprocess_loaded_state_dict is not None:
+                weight_iterator = preprocess_loaded_state_dict(weight_iterator)
+            if is_bnb_quantized:
+                normal_weights, raw_quant_state = split_bitsandbytes_4bit_state(
+                    weight_iterator
+                )
+                bnb_quant_states = build_bitsandbytes_4bit_quant_states(
+                    [name for name, _ in normal_weights],
+                    raw_quant_state,
+                    device,
+                    param_names_mapping_fn,
+                )
+                weight_iterator = iter(normal_weights)
+        else:
+            weight_iterator = iter(())
+
         load_model_from_full_model_state_dict(
             model,
             weight_iterator,
@@ -343,6 +395,7 @@ def maybe_load_fsdp_model(
             strict=strict,
             cpu_offload=load_cpu_offload,
             param_names_mapping=param_names_mapping_fn,
+            preconverted_state_dict=preconverted_state_dict,
         )
         if bnb_quant_states:
             attach_bitsandbytes_4bit_quant_states(
@@ -465,6 +518,18 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    preconverted_state_dict: (
+        tuple[
+            dict[
+                str,
+                torch.Tensor
+                | rank_local_checkpoint.LocalFSDPShard
+                | rank_local_checkpoint.LocalTPShard,
+            ],
+            dict[str, tuple[str, Any, Any]],
+        ]
+        | None
+    ) = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -487,14 +552,17 @@ def load_model_from_full_model_state_dict(
     param_dict = dict(model.named_parameters())
 
     # map names from checkpoint to customized names
-    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator,
-        param_names_mapping,
-        valid_target_names=set(meta_sd.keys()),
-    )  # type: ignore
+    if preconverted_state_dict is None:
+        custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
+            full_sd_iterator,
+            param_names_mapping,
+            valid_target_names=set(meta_sd.keys()),
+        )  # type: ignore
+    else:
+        custom_param_sd, reverse_param_names_mapping = preconverted_state_dict
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(
-        hasattr(p, "device_mesh") for p in meta_sd.values()
+        isinstance(param, dist_tensor.DTensor) for param in meta_sd.values()
     )
 
     # sort parameter names to ensure all ranks process parameters in the same order
@@ -517,7 +585,7 @@ def load_model_from_full_model_state_dict(
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
-        full_tensor = custom_param_sd[target_param_name]
+        loaded_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
 
         if meta_sharded_param is None:
@@ -530,23 +598,29 @@ def load_model_from_full_model_state_dict(
                 skipped_checkpoint_keys.append(target_param_name)
                 continue
 
-        # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
-        # for non-quantized models meta dtype equals param_dtype anyway
-        if meta_sharded_param is None:
-            # for nunchaku, some scales are patched later
-            target_dtype = full_tensor.dtype
-        else:
-            target_dtype = meta_sharded_param.dtype
-
-        full_tensor = _maybe_dequantize_fp8(
-            full_tensor, target_dtype, target_param_name, custom_param_sd
+        target_dtype = meta_sharded_param.dtype
+        is_rank_local_fsdp_shard = isinstance(
+            loaded_tensor, rank_local_checkpoint.LocalFSDPShard
         )
+        is_rank_local_tp_shard = isinstance(
+            loaded_tensor, rank_local_checkpoint.LocalTPShard
+        )
+        is_rank_local_shard = is_rank_local_fsdp_shard or is_rank_local_tp_shard
+        full_tensor = loaded_tensor.tensor if is_rank_local_shard else loaded_tensor
+
+        if not is_rank_local_shard:
+            full_tensor = _maybe_dequantize_fp8(
+                full_tensor,
+                target_dtype,
+                target_param_name,
+                custom_param_sd,  # type: ignore[arg-type]
+            )
 
         if full_tensor.dtype != target_dtype:
             mismatch_key = (full_tensor.dtype, target_dtype)
             if (
-                full_tensor.dtype in _QUANTIZED_DTYPES
-                or target_dtype in _QUANTIZED_DTYPES
+                full_tensor.dtype in rank_local_checkpoint.QUANTIZED_DTYPES
+                or target_dtype in rank_local_checkpoint.QUANTIZED_DTYPES
             ):
                 quantized_dtype_mismatch_counts[mismatch_key] += 1
                 if (
@@ -566,11 +640,41 @@ def load_model_from_full_model_state_dict(
                         target_param_name
                     )
 
-        if not hasattr(meta_sharded_param, "device_mesh"):
+        if is_rank_local_fsdp_shard:
+            if not isinstance(meta_sharded_param, dist_tensor.DTensor):
+                raise TypeError(
+                    f"Rank-local FSDP shard produced for non-DTensor parameter {target_param_name}"
+                )
+            local_tensor = full_tensor.to(
+                device=checkpoint_load_device,
+                dtype=target_dtype,
+            )
+            sharded_tensor = dist_tensor.DTensor.from_local(
+                local_tensor,
+                meta_sharded_param.device_mesh,
+                meta_sharded_param.placements,
+                run_check=False,
+                shape=meta_sharded_param.shape,
+                stride=meta_sharded_param.stride(),
+            )
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.to("cpu")
+        elif is_rank_local_tp_shard:
+            if isinstance(meta_sharded_param, dist_tensor.DTensor):
+                raise TypeError(
+                    f"Rank-local TP shard produced for DTensor parameter {target_param_name}"
+                )
+            sharded_tensor = full_tensor.to(
+                device=checkpoint_load_device,
+                dtype=target_dtype,
+            )
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
+        elif not isinstance(meta_sharded_param, dist_tensor.DTensor):
             full_tensor = full_tensor.to(
                 device=checkpoint_load_device, dtype=target_dtype
             )
-            actual_param = _get_param_for_weight_loading(
+            actual_param = rank_local_checkpoint.get_param_for_weight_loading(
                 model, param_dict, target_param_name
             )
             weight_loader = (
@@ -623,7 +727,7 @@ def load_model_from_full_model_state_dict(
             full_tensor = full_tensor.to(
                 device=checkpoint_load_device, dtype=target_dtype
             )
-            actual_param = _get_param_for_weight_loading(
+            actual_param = rank_local_checkpoint.get_param_for_weight_loading(
                 model, param_dict, target_param_name
             )
             weight_loader = (

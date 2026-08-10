@@ -11,8 +11,11 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_hcu
 
 from .utils import make_name
+
+_is_hcu = is_hcu()
 
 
 @cache_once
