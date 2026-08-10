@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_hcu_ci(est_time=7, suite="nightly-hcu-1-gpu", nightly=True)
 
 import unittest
