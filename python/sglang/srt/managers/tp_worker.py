@@ -570,6 +570,7 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_hidden_states_before_norm: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -580,7 +581,7 @@ class TpModelWorker(BaseTpWorker):
                 batch,
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
-                return_hidden_states_before_norm=False,
+                return_hidden_states_before_norm=return_hidden_states_before_norm,
             )
         else:
             # FIXME(lsyin): unify the interface of forward_batch

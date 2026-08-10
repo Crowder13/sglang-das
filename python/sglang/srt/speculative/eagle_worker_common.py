@@ -305,7 +305,10 @@ def prepare_for_draft(
         batch,
         draft_model_runner,
         capture_hidden_mode=capture_mode,
-        return_hidden_states_before_norm=False,
+        return_hidden_states_before_norm=(
+            getattr(draft_model_runner.model_config, "hc_hidden_size", None)
+            is not None
+        ),
     )
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
@@ -501,6 +504,14 @@ def run_eagle_verify(
             batch,
             target_worker,
         )
+
+    # Eager target-verify must mirror graph capture for mHC models. Otherwise
+    # the following draft-extend receives [tokens, hidden_size] instead of the
+    # required [tokens, hc_mult * hidden_size] recurrent state.
+    verify_forward_batch.return_hidden_states_before_norm = (
+        getattr(target_worker.model_runner.model_config, "hc_hidden_size", None)
+        is not None
+    )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
