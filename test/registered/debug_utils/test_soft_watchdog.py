@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 )
 
 register_hcu_ci(est_time=120, suite="nightly-hcu-core-functional", nightly=True)
-register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=240, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=622, suite="base-c-test-cpu")
 

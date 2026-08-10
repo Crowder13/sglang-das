@@ -60,6 +60,8 @@
 #include <hip/hip_runtime.h>
 #endif
 
+namespace sglang {
+
 namespace host {
 
 namespace details {
@@ -346,7 +348,7 @@ struct SymbolicDType {
 
   template <typename T>
   auto is_type() const -> bool {
-    return ::host::is_type<T>(m_value);
+    return host::is_type<T>(m_value);
   }
 
  private:
@@ -643,3 +645,5 @@ struct TensorMatcher {
 };
 
 }  // namespace host
+
+}  // namespace sglang

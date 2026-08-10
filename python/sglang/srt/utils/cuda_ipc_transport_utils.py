@@ -23,7 +23,9 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+)
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -145,7 +147,7 @@ class MmItemMemoryChunk:
     def try_to_recycle(self, recycle_count: Optional[int] = None) -> bool:
         if recycle_count is None:
             try:
-                recycle_count = get_server_args().tp_size
+                recycle_count = configured_tp_size()
             except Exception:
                 logger.info(
                     "server_args has not been published yet, skip this turn's recycle"
@@ -364,7 +366,7 @@ class MmItemMemoryPoolGroup:
     def __init__(self, memory_size, recycle_interval, tp_size: Optional[int] = None):
         if tp_size is None:
             try:
-                tp_size = get_server_args().tp_size
+                tp_size = configured_tp_size()
             except Exception:
                 tp_size = torch.cuda.device_count()
         if tp_size > torch.cuda.device_count():

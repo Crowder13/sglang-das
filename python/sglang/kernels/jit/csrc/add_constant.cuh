@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr size_t kBlockSize = 256;
 constexpr size_t kVectorizedMinElements = 1 << 20;
@@ -102,4 +102,4 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   }
 }
 
-}  // namespace
+}  // namespace sglang

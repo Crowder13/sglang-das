@@ -41,7 +41,7 @@ register_hcu_ci(
     nightly=True,
     disabled="BW1100 routing-key scheduling did not finish within the quick-validation window even after reducing long requests; needs scheduler专项 validation.",
 )
-register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=184, suite="base-c-test-cpu")
 

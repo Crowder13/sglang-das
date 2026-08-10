@@ -67,23 +67,9 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define __shfl_xor_sync(mask, var, lane_mask, ...) __shfl_xor(var, lane_mask, ##__VA_ARGS__)
 #endif
 
-#ifdef USE_ROCM
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = __hip_fp8_e4m3;
-using fp8_e5m2_t = __hip_fp8_e5m2;
+namespace sglang {
 
-using fp32x2_t = float2;
-using fp16x2_t = __half2;
-using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = __hip_fp8x2_e4m3;
-using fp8x2_e5m2_t = __hip_fp8x2_e5m2;
-using fp8x4_e4m3_t = uint32_t;
-using fp8x4_e5m2_t = uint32_t;
-
-using fp32x4_t = float4;
-#else
+#ifndef USE_ROCM
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -97,6 +83,25 @@ using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
 using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
+
+using fp32x4_t = float4;
+#else
+// HCU: native HIP FP8 vector types instead of the uint-backed aliases used by
+// generic ROCm, so the DCU elementwise/quantization kernels keep their typed
+// conversions.
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = __hip_fp8_e4m3;
+using fp8_e5m2_t = __hip_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = __hip_fp8x2_e4m3;
+using fp8x2_e5m2_t = __hip_fp8x2_e5m2;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
 
 using fp32x4_t = float4;
 #endif
@@ -255,7 +260,7 @@ namespace host {
 inline void RuntimeDeviceCheck(::hipError_t error, DebugInfo location = {}) {
   if (error != ::hipSuccess) {
     [[unlikely]];
-    ::host::panic(location, "HIP error: ", ::hipGetErrorString(error));
+    panic(location, "HIP error: ", ::hipGetErrorString(error));
   }
 }
 
@@ -331,7 +336,7 @@ struct LaunchKernel {
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
-    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
 
@@ -481,6 +486,8 @@ struct LaunchKernel {
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
-    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
+
+}  // namespace sglang
