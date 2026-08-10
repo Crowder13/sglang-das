@@ -74,6 +74,7 @@ class DsparkDraftSampler:
                 device=device,
             )
 
+    @torch.inference_mode()
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
