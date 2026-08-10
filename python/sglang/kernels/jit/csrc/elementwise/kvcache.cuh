@@ -15,7 +15,7 @@
 #include <cassert>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct StoreKVCacheParams {
   const void* __restrict__ k;
@@ -322,4 +322,4 @@ struct StoreKVCacheKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 using Plan = device::compress::PrefillPlan;
 
@@ -267,4 +267,4 @@ struct FusedNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

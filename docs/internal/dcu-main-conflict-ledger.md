@@ -2252,3 +2252,161 @@ actual result in the checkpoint note.
   uses the renamed `host_pool_kwargs` instead of the stale `kw`.
 - Status: merge is resolved and fully staged but **not committed and not
   pushed**, pending user review.
+
+### Official main 20260810 — v0.5.17 sync, conflicts resolved
+
+**Official reference point**
+
+- Source of truth: `/home/officials/sglang`, fast-forwarded to
+  `origin/main` = **`410088c91e4a6f9df5a071891578aa102262fe9b`**
+  (`[NPU] Increase the retry count to 3 for the GSM8K. (#34103)`, 2026-08-10).
+- **`v0.5.17` tag = `29481685462732237d80d86076d6563e1f658102`**
+  (`[Cherry-pick to release/v0.5.17] fix(PP): size the mamba pool per pipeline
+  stage, not per whole model (#33666) (#34035)`, 2026-08-07 14:50:47 -0700).
+  That commit is the last one on `origin/release/v0.5.17`.
+- `v0.5.17` is **not** an ancestor of `main`: the release branch carries 12
+  extra commits. Every one of them is contained in `main` by content, so
+  merging `main` subsumes the release:
+  - nine `[Cherry-pick to release/v0.5.17] ... (#N)` commits whose original
+    PRs are all in `main` (#33666, #33650, #33599, #33500, #33956, #33772,
+    #33564, #33348, #32588);
+  - `d3cba9109d` (gdn `-1` padding sentinel, #33810) has the identical
+    `git patch-id` as `db8f3cdd11` on `main`;
+  - `20cef1816b` (Mistral-Large-3 EAGLE draft) is `dd7e4c91e2` (#33785);
+  - `bc2fc41fae` (Nemotron DP attention, #33123) is `a14c870886`.
+
+**Merge**
+
+- The 2026-08-07 sync was committed first as `80e01615e8`, so the merge base
+  for this round is exactly the previous official endpoint `9aadacfc5325`; no
+  new `-s ours` anchor was needed.
+- Branch `sync/official-main-20260810`, range `9aadacfc5325..410088c91e`
+  = 130 commits / 926 files / +36518 -14959. **34 conflicts** (26 UU, 4 UD,
+  4 AU), all resolved.
+
+**Kernel-tree restructure (official, adopted verbatim)**
+
+- `[jit_kernel] Move JIT kernels into namespace sglang (#33400)` plus
+  `#34106` wrap the JIT headers in `namespace sglang`. Audit result: the HCU
+  branch adds **no JIT source files of its own** (every file under
+  `python/sglang/kernels/jit/` also exists upstream), so the namespace move
+  applied cleanly everywhere except the three headers we had modified:
+  - `include/sgl_kernel/tensor.h`: HIP includes stay above the namespace,
+    then `namespace sglang {`.
+  - `include/sgl_kernel/utils.h`: the `__grid_constant__` fallback macro
+    stays above the namespace.
+  - `include/sgl_kernel/utils.cuh`: adopted the official
+    `namespace sglang` + `#ifndef USE_ROCM` ordering while keeping the HCU
+    ROCm branch on **native HIP FP8 types** (`__hip_fp8_e4m3` /
+    `__hip_fp8x2_e4m3`) instead of the generic uint8/uint16-backed aliases,
+    which the DCU elementwise and quantization kernels rely on.
+- JIT wrapper symbol strings in `python/sglang/kernels/**/*.py` were diffed
+  against `officials/main`: identical sets, so no call site needed a
+  `sglang::` qualification.
+- `sgl-kernel/` had already moved to `python/sglang/kernels/aot/` in the
+  previous sync; `/home/scripts/install_sglang.sh` is updated to build from
+  the new path (old copy kept as `install_sglang.sh.bak-20260810`).
+
+**Other notable resolutions**
+
+- `layers/quantization/fp8_utils.py`: `apply_fp8_linear` was restructured
+  upstream (pre-quantized fp8 activations, `channelwise_cutlass`,
+  `native_scalar_a_scale`, `output_dtype`). Adopted wholesale; the two HCU
+  DeepGEMM paths were re-attached around it — the `(qinput, scale)` tuple
+  fast path now runs before the 2-D view, and the post-quant `_is_hcu`
+  DeepGEMM call now emits `output_dtype` instead of `input.dtype`.
+- `models/deepseek_v4.py`: kept `_use_aiter = ... and not _is_hcu` plus
+  `_use_aiter_tilelang_mhc` alongside the new FlashInfer `mhc_pre_big_fuse`
+  helpers; the HCU pre-hc-head CP path now also honors the new
+  `cp_v2_active` gate (CP v2 partitions per rank and needs no re-gather).
+- `layers/attention/triton_backend.py`: kept the HCU AITER Triton extend
+  opt-in and added the official `verify_mla_fwd` import and `verify_fwd`
+  selection; the v_head_dim probe keeps the HCU hasattr/try-except chain but
+  now queries `start_layer` rather than layer 0, which is the official PP fix.
+- `mem_cache/deepseek_v4_memory_pool.py`: both
+  `set_swa_key_buffer_radix_lightop_fused` (HCU) and the new
+  `set_unified_key_buffer_radix_fused_norm_rope` are kept.
+- `multimodal_gen/runtime/loader/fsdp_load.py`: the HCU streaming
+  state-dict load became the first branch; upstream's rank-local
+  preconverted-checkpoint path is the `else`.
+- `multimodal_gen/runtime/layers/usp.py`: union — official
+  `_merge_attention_partials` / `_ring_merge_attention` /
+  `_ring_attention_varlen` plus the HCU `ring_attn_overlap` (both sets have
+  live callers).
+- `models/glm4_moe.py`: adopted the official
+  `shared_experts_fusion_disable_reason` classmethod and re-applied the
+  HCU/AMD platform naming in its two messages.
+- `utils/cuda_ipc_transport_utils.py`: kept the optional `recycle_count`
+  parameter but switched both it and `MmItemMemoryPoolGroup` to the official
+  `configured_tp_size()` accessor.
+- Eight upstream test deletions accepted (four via directory-rename
+  detection into `test/registered/models_e2e/`, four plain), all from
+  `[CI] Trim redundant nightly test registrations (#34070)`; their HCU CI
+  registrations are lost with the files.
+
+**Semantic audit**
+
+Five findings absent from both the official target and the pre-merge HEAD
+were repaired:
+
+- `multimodal_gen/runtime/loader/fsdp_load.py` — upstream deleted
+  `_QUANTIZED_DTYPES` and `_get_param_for_weight_loading`, but the HCU
+  streaming loader still calls them; both restored.
+- `models/minimax_m2.py` — lost its `get_server_args` import (five call
+  sites); restored.
+- `layers/attention/dsv4/compressor.py` and `layers/dp_attention.py` — two
+  imports that upstream's accessor migration made unused; removed.
+
+**Static gates**
+
+No unmerged entries, no conflict markers, staged `git diff --check` clean,
+641 changed Python files compile, `verify_hcu_registration.py` OK,
+`check_hcu_runtime_text.py` OK, `check_hcu_external_api_compat.py` OK, DSA
+alias/CLI registry 19 passed, `setup_hip.py --name` OK on `gfx938`. Ruff
+`F821,F401,F811` over `python/ test/ scripts/ rust/` yields **zero findings
+absent from both `officials/main` and the pre-merge HEAD** (line numbers must
+be normalized out of the comparison).
+
+**Rebuild**
+
+`bash /home/scripts/install_sglang.sh /home/proj_sglang_open/sglang-das` in
+`rye_sglang_0807` rebuilt `sglang-kernel==0.4.6.post1` from
+`python/sglang/kernels/aot` (hipcc, `--offload-arch` through gfx938) and
+reinstalled editable `sglang-0.5.18.dev771+g80e01615e`.
+
+**Runtime status: pending.** The DeepSeek-V4 pure-TP accuracy run has not
+been started: `hy-smi` on the node shows HCU0-3 at 62% VRAM and HCU4/HCU7 at
+100% utilization from other tenants, so the mandatory all-idle preflight
+fails. Per the standing rule the run was not moved to another host and no
+foreign process was terminated.
+
+**Runtime validation (2026-08-10, `zz-sglang2` / `rye_sglang_0807`)**
+
+The run was moved off `zz-nmz26` at the user's direction because that node's
+cards were held by other tenants; `zz-sglang2` reported all eight HCUs at 0%
+VRAM / 0% utilization. `/home` is the same shared mount, so the container saw
+the identical staged tree with no code copy.
+
+- Rebuild via the updated `install_sglang.sh`: `sglang-kernel 0.4.6.post1`
+  from `python/sglang/kernels/aot`, editable `sglang 0.5.18.dev771+g80e01615e`.
+- **First launch failed to JIT-compile** — the one real defect the namespace
+  restructure introduced. `utils.cuh` called `::host::panic(...)` inside the
+  HCU `RuntimeDeviceCheck`; with `host` now nested in `namespace sglang`, the
+  global-scope qualification no longer resolves
+  (`error: no member named 'host' in the global namespace`). Changed to the
+  unqualified `panic(...)`, which binds to `sglang::host::panic` from the
+  enclosing namespace. A follow-up audit of every JIT file we diverge from
+  upstream on (24 files) found no other global-scope qualification and
+  confirmed all HCU `#include <hip/...>` lines sit above the namespace open.
+- Second launch: weight load 27.48 s, decode CUDA graph capture 103.34 s
+  through bs=128 with 0.65 GB graph memory and 25.38 GB free,
+  `max_total_num_tokens=9775104`, server ready at 12:15:51.
+- **Accuracy: GSM8K 100 questions = 0.950, invalid 0.000**, latency 36.6 s,
+  output throughput 233.7 tok/s. Free-form generations are coherent
+  ("The capital of France is" -> " Paris. The capital of Spain is Madrid...",
+  12*8 -> "96"), and three repeated greedy requests are byte-identical.
+- No VMFault, illegal access, or scheduler exception in the server log. All
+  eight cards returned to 0% after shutdown.
+
+This clears the accuracy question that the 2026-08-07 entry had left open as a
+non-blocking observation: on this tree the DSV4 pure-TP output is correct.
