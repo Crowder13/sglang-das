@@ -306,8 +306,7 @@ def prepare_for_draft(
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=(
-            getattr(draft_model_runner.model_config, "hc_hidden_size", None)
-            is not None
+            getattr(draft_model_runner.model_config, "hc_hidden_size", None) is not None
         ),
     )
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
