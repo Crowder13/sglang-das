@@ -5,12 +5,21 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_hcu, is_npu
 
 if not is_cpu():
-    from sglang.kernels.ops.attention.fla.fused_recurrent import (
-        fused_recurrent_kda_packed_decode,
-    )
+    if is_hcu():
+        # HCU: operator-team packed-decode adapter. Its signature matches
+        # fused_recurrent_kda_packed_decode exactly (incl. lower_bound), so the
+        # call site below is unchanged. Requires num_v_heads == num_k_heads == H
+        # and L2-normalized Q/K, both true for Kimi-K3 (see kda_hcu.py docstring).
+        from sglang.kernels.ops.attention.fla.kda_hcu import (
+            fused_recurrent_kda_packed_decode_hcu as fused_recurrent_kda_packed_decode,
+        )
+    else:
+        from sglang.kernels.ops.attention.fla.fused_recurrent import (
+            fused_recurrent_kda_packed_decode,
+        )
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
@@ -23,10 +32,7 @@ if not is_cpu():
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
-    # XPU has no tvm_ffi CUDA JIT kernel for KDA packed decode; route XPU to the
-    # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
-    # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
-    supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_packed_decode: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
