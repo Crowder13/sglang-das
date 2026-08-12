@@ -23,7 +23,7 @@ from sglang.test.test_utils import run_doctests
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 register_hcu_ci(
     est_time=20,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
 )
 
 
