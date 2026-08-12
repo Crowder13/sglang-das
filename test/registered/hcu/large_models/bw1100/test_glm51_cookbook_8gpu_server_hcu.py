@@ -16,15 +16,15 @@ import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_cookbook_utils import (
-    CookbookServer,
     GLM51_8GPU_MODELS,
+    CookbookServer,
     selected_configs,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 register_hcu_ci(
-    est_time=14400,
-    suite="nightly-hcu-large-model-8gpu",
+    est_time=7200,
+    suite="nightly-hcu-large-model-8",
     nightly=True,
 )
 

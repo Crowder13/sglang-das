@@ -288,9 +288,6 @@ def collect_results(
 
     for partition in sorted(collected.missing_partitions):
         collected.diagnostics.append(f"missing partition status for {partition}")
-    for partition, outcome in sorted(collected.failed_partitions.items()):
-        collected.diagnostics.append(f"partition {partition} outcome={outcome}")
-
     for field_name in ("target_ref", "commit_sha", "image_ref", "image_id"):
         values = {
             getattr(status, field_name)
@@ -381,23 +378,23 @@ def _column_set(columns: List[Tuple[str, int]], *, grey: bool = False) -> dict:
 
 
 def _short_image_id(image_id: str) -> str:
-    compact = _single_line(image_id).removeprefix("sha256:")
+    compact = _single_line(image_id)
+    if compact.startswith("sha256:"):
+        compact = compact[len("sha256:") :]
     return compact[:12] or "unknown"
 
 
 def _overall_status(
-    collected: CollectedResults, workflow_result: str
+    collected: CollectedResults, _workflow_result: str
 ) -> Tuple[str, str, str]:
     if collected.regressions:
         return "red", "存在未达标", "存在模型精度低于阈值"
-    has_infra_issue = bool(
-        collected.missing_models
-        or collected.diagnostics
-        or collected.failed_partitions
-        or workflow_result != "success"
-    )
+    # The shared accuracy partition also runs MiMo and MMLU. If either fails
+    # after all nine expected GSM8K results were written, the nine-model card
+    # is still complete and should retain its result-derived status.
+    has_infra_issue = bool(collected.missing_models or collected.diagnostics)
     if has_infra_issue:
-        return "orange", "结果不完整", "存在基础设施或范围外测例异常"
+        return "orange", "结果不完整", "存在精度分片或结果异常"
     return (
         "green",
         "全部通过",
