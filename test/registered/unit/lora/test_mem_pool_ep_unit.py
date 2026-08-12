@@ -31,7 +31,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_hcu_ci(est_time=9, suite="nightly-hcu-1-gpu", nightly=True)
+register_hcu_ci(est_time=9, suite="nightly-hcu-1", nightly=True)
 
 import ast
 import types

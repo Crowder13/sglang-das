@@ -35,7 +35,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 register_hcu_ci(
     est_time=2,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
 )
 

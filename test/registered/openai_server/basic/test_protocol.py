@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,11 +32,19 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelList,
     UsageInfo,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
-register_cuda_ci(est_time=3, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=3, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_hcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-hcu", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(
+    est_time=10,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
 
 
 class TestModelCard(unittest.TestCase):

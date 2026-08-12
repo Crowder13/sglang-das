@@ -1662,6 +1662,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ) in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.

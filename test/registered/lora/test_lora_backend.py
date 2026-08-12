@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +21,11 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
@@ -29,7 +37,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-register_cuda_ci(est_time=200, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=200, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(
     est_time=200,
     suite="stage-b-test-1-gpu-small-amd",
@@ -37,7 +45,7 @@ register_amd_ci(
 )
 register_hcu_ci(
     est_time=200,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: LoRA CI matrix uses remote base/adapters; needs local base and adapter mapping before enabling.",
 )
 

@@ -28,7 +28,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_hcu_ci(
     est_time=1,
-    suite="nightly-hcu-1-gpu",
+    suite="nightly-hcu-1",
     nightly=True,
     disabled="HCU nightly deferred: current BW1100 CI image lacks torchaudio; mm_process_config audio processor subtest imports torchaudio.functional.",
 )

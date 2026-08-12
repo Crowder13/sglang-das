@@ -18,7 +18,11 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
@@ -26,12 +30,12 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=50, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=50, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU RL/speculative path needs local model mapping and quick validation before enabling.",
 )
 
