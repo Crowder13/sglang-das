@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +25,11 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -36,12 +44,12 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
-register_cuda_ci(est_time=73, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=73, stage="stage-b", runner_config="1-gpu-small")
 
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before HCU allocation on BW1100; OpenAI embedding API smoke is enabled separately.",
 )
 

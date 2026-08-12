@@ -23,7 +23,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlam
 register_cuda_ci(est_time=870, stage="base-b", runner_config="1-gpu-small")
 register_hcu_ci(
     est_time=840,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: EAGLE tree decoding needs BW1100 draft/target model mapping before enabling.",
 )

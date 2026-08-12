@@ -2410,3 +2410,82 @@ the identical staged tree with no code copy.
 
 This clears the accuracy question that the 2026-08-07 entry had left open as a
 non-blocking observation: on this tree the DSV4 pure-TP output is correct.
+
+### v0.5.15.post1_dev daily forward-port 20260811 — conflicts resolved
+
+**Reference points**
+
+- Target pre-merge `main`: `8f7a660e58527db05b130f5609d95b86885f84da`
+  (`sync/official-main-20260810`, official v0.5.17 catch-up).
+- Source: `/home/proj_dpsk-v4/sglang-das`, branch
+  `v0.5.15.post1_dev`, endpoint
+  `ad1fea5d74f6264de5734bee8971bbade980343d`.
+- Confirmed merge base and last v0.5.15.post1_dev commit already contained by
+  `main`: `b97d7df6ee606d51c8a96b07b447b1a536a7e0af`
+  (`Forward port/v0.5.12 dev daily 20260729 (#146)`). This is an exact graph
+  merge-base, not a subject/date inference.
+- Source range `b97d7df6ee..ad1fea5d74`: 198 commits (150 non-merge and
+  48 merge commits), net 357 files / +26975 -799.
+- Local integration branch:
+  `forward-port/v0.5.15-post1-dev-20260811`; full source history is preserved
+  as merge parent. Nothing is pushed or merged back to `main` in this step.
+
+**Conflict resolution**
+
+- The no-commit merge produced 65 conflicts: 27 `UU`, 23 `AA`, and 15 `DU`.
+- MiniMax-H3 and the JIT-kernel relocation use official `main` as the structural
+  base. The release implementation referenced the removed
+  `sglang.jit_kernel` layout and used a newly introduced `is_dcu()` helper;
+  importing those files wholesale would have reverted the current
+  `sglang.kernels` refactor. The HCU behavior was re-expressed in the new
+  structure instead:
+  - CUDA-source fused QKNorm+RoPE is disabled by the existing `is_hcu()` path.
+  - Hygon AITER's non-top-level varlen attention fallback and its explicit
+    Triton configuration are retained in the newer AITER backend.
+  - ROCm MiniMax FlashAttention-2 selection uses `is_hcu()`; the duplicate
+    `is_dcu()` definition and all new `_is_dcu`/`is_dcu` call sites are removed.
+- `models/hunyuan_v3.py` uses the release branch's PP support, expert-buffer
+  handling, and routed-scaling-factor fix as the base. Official main's
+  HPC-Ops FP8 attention path is restored alongside it and explicitly guarded
+  with `not _is_hcu`. `_use_aiter` remains disabled on HCU so routed scaling is
+  applied exactly once; the existing LightOp fused rotary/KV-store path is
+  unchanged.
+- The official test-tree deletions are accepted for 15 `DU` paths. Their only
+  post-base release changes were CI suite-name normalization; equivalent
+  registrations were carried into surviving/moved tests. A follow-up
+  registration gate found and corrected the remaining legacy
+  `stage-b-test-1-gpu-small-hcu` / `nightly-hcu-1-gpu` names.
+- HCU workflow conflicts take the release policy (main plus
+  `v0.5.15.post1_dev`, normalized suite names, PR-files API, external-API gate)
+  while keeping current main paths and wheel naming.
+- Non-conflicting runtime changes retained from the source include DeepSeek-V4
+  LightOp KV-cache API migration, LightOp MoE/quant imports, HCU TopK EPLB
+  post-processing, GLM/Hunyuan routed-scaling fixes, SlimQuant W4A8, HCU PD
+  tooling/tests, and the Anthropic gateway router.
+
+**Static evidence**
+
+- `git ls-files -u`: empty; precise conflict-marker scan over changed files:
+  empty; staged `git diff --check`: clean.
+- All changed Python files compile.
+- Ruff `E9,F401,F811,F821,F841` is clean for every manually merged core file.
+  The broad changed-file scan reports only pre-existing findings in files whose
+  actual forward-port delta is a CI registration line, plus two pre-existing
+  runtime `F841` findings; the one new intentional `psutil` registration import
+  is annotated `noqa: F401`.
+- `verify_hcu_registration.py`, `check_hcu_runtime_text.py`, and
+  `check_hcu_external_api_compat.py`: pass. DSA alias/CLI registry: 19 passed.
+- Repository Python code contains no `_is_dcu` or `is_dcu` tokens after the
+  refactor audit.
+
+**Runtime validation: passed (user-verified, 2026-08-12).** On 2026-08-11 the required
+preflight rejected both allowed environments: `zz-sglang2/rye_sglang_0810`
+had HCU0-3 at 90% VRAM and HCU7 at 100% utilization; the fallback
+`zz-nmz26/rye_sglang_0810` had all eight cards at 82% VRAM and 15%-79%
+utilization. No server was launched and no foreign process was touched. The
+required pure-TP command was subsequently run by the user:
+`bash run_dpsk-v4.sh 10015
+/module/DeepSeek-V4-Flash-0731-FP8-Channel`. The user confirmed that pure-TP
+accuracy is correct, clearing the final functional gate for the local merge
+commit. Detailed score and server log were not supplied to this session, so
+this entry records the result as user-verified rather than agent-observed.

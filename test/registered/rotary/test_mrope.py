@@ -34,15 +34,19 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1100.",
 )
 

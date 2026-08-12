@@ -235,6 +235,7 @@ def moe_fused_gate_hcu(
     topk: int,
     num_fused_shared_experts: int,
     routed_scaling_factor: float,
+    apply_routed_scaling_factor_on_output: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_weights, topk_ids = op.moe_fused_gate(
         gating_output,
@@ -244,6 +245,7 @@ def moe_fused_gate_hcu(
         topk,
         num_fused_shared_experts,
         routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
     )
     return topk_weights, topk_ids
 
@@ -256,6 +258,7 @@ def moe_fused_gate_fake(
     topk: int,
     num_fused_shared_experts: int,
     routed_scaling_factor: float,
+    apply_routed_scaling_factor_on_output: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty(
         (gating_output.size(0), topk),
@@ -1850,7 +1853,6 @@ def biased_grouped_topk_gpu(
             apply_routed_scaling_factor_on_output,
         )
     elif _use_lightop:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_hcu(
             gating_output,
             correction_bias,
@@ -1859,6 +1861,7 @@ def biased_grouped_topk_gpu(
             topk,
             num_fused_shared_experts,
             routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
         )
         # LightOp already returns HCU expert IDs in its runtime layout. Applying
         # the generic EPLB remap here a second time breaks MiMo routing.
@@ -2529,6 +2532,17 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 **_fused_topk_kwargs,
             )
+            # HCU does not enter the CUDA-only common postprocess below.  Keep
+            # the fused TopK path consistent with the existing HCU biased and
+            # grouped TopK paths by applying EPLB logical-to-physical mapping
+            # here exactly once.
+            if _is_hcu and (
+                expert_location_dispatch_info is not None
+                or num_token_non_padded is not None
+            ):
+                topk_ids = _topk_ids_postprocess(
+                    topk_ids, expert_location_dispatch_info, num_token_non_padded
+                )
     else:
         # custom_routing_function itself is padding-unaware; its output on
         # padded rows is garbage. That is fine because _post_process_topk_ids
