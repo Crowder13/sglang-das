@@ -181,6 +181,7 @@ QUANTIZATION_CHOICES = [
     "unquant",
     "slimquant_marlin",
     "humming",
+    "slimquant_w4a8_marlin",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
