@@ -2504,6 +2504,20 @@ class ServerArgs:
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
+    ep_static_dispatch_policy: A[
+        Literal["nearest", "locality_fair"],
+        Arg(
+            help=(
+                "Choose the replica-selection policy for static expert dispatch. "
+                "`nearest` preserves the legacy nearest-replica behavior. "
+                "`locality_fair` builds a deterministic source-rank-to-replica map "
+                "that preserves same-GPU, then same-node locality while balancing "
+                "static bindings among equally local replicas; it does not rebalance "
+                "live token traffic."
+            )
+        ),
+        NS("exec.moe"),
+    ] = "nearest"
     init_expert_location: A[str, "Initial location of EP experts.", NS("exec.moe")] = (
         "trivial"
     )
@@ -7525,6 +7539,12 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
+            raise ValueError(
+                "--ep-static-dispatch-policy must be one of "
+                "'nearest' or 'locality_fair'."
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self._declare(
                 "_handle_eplb_and_dispatch",
@@ -7546,6 +7566,16 @@ class ServerArgs:
                 ep_dispatch_algorithm=(
                     "dynamic" if needs_rank_invariant_dispatch else "static"
                 ),
+            )
+
+        if (
+            self.ep_static_dispatch_policy != "nearest"
+            and self.ep_dispatch_algorithm != "static"
+        ):
+            raise ValueError(
+                "--ep-static-dispatch-policy locality_fair requires "
+                "--ep-dispatch-algorithm static. It configures a startup-time "
+                "source-rank-to-replica map, not dynamic token balancing."
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
