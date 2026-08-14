@@ -354,16 +354,22 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
-        assert num_experts % self.moe_ep_size == 0
-        # self.num_local_experts = num_experts // self.moe_ep_size
-        if self.moe_ep_size != 0:
-            self.num_local_experts, self.expert_map = determine_expert_map(
-                ep_size=self.moe_ep_size,
-                ep_rank=self.moe_ep_rank,
-                global_num_experts=num_experts,
-            )
-        else:
-            self.local_num_experts, self.expert_map = (self.global_num_experts, None)
+        # HCU: upstream dropped `expert_map` from FusedMoE, but DeepEPMoE still
+        # consumes it (see ep_moe/layer.py), so keep deriving it here -- and only
+        # it. `num_local_experts` is already computed above from
+        # `_num_global_routed`, which excludes the fused shared slots; the old
+        # 0.5.12-era block re-derived it from `num_experts` and guarded that with
+        # `assert num_experts % self.moe_ep_size == 0`. That check is on the
+        # wrong quantity: when the fused shared slots are not per-rank (a2a
+        # backend "none", e.g. DSpark standalone) `num_experts` is
+        # routed + n_shared and need not divide by ep_size, so the assert fired
+        # even though the routed count divides cleanly. On the DeepEP path the
+        # two expert counts coincide, so dropping the override is a no-op there.
+        self.expert_map = determine_expert_map(
+            ep_size=self.moe_ep_size,
+            ep_rank=self.moe_ep_rank,
+            global_num_experts=num_experts,
+        )[1]
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
