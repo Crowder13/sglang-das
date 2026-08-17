@@ -294,6 +294,7 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        self._fill_num_token_non_padded(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -352,6 +353,7 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        self._fill_num_token_non_padded(draft_forward_batch)
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (
@@ -373,6 +375,29 @@ class DraftBlockProposer:
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
         )
+
+    def _fill_num_token_non_padded(self, forward_batch: ForwardBatch) -> None:
+        """Populate num_token_non_padded, mirroring ForwardBatch.init_new.
+
+        The draft and idle batches here are built by calling ForwardBatch
+        directly, which skips the init_new block that sets these fields. They
+        are only used when moe_ep_size > 1: with EP the decode CUDA graph
+        registers a num_token_non_padded slot whose post_fill converts this
+        global count into a per-attn-TP-rank local one, so leaving it None
+        makes DP+EP+DSpark decode fail with a TypeError on the first idle
+        participation. Kept independent of _dp_moe_sync, which gates a
+        different concern and is off for the draft batch in some configs.
+        """
+        num_tokens = (
+            len(forward_batch.input_ids) if forward_batch.input_ids is not None else 0
+        )
+        if enable_num_token_non_padded():
+            forward_batch.num_token_non_padded = (
+                torch.tensor(num_tokens, dtype=torch.int32)
+                .pin_memory()
+                .to(self.draft_model_runner.device, non_blocking=True)
+            )
+        forward_batch.num_token_non_padded_cpu = num_tokens
 
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
