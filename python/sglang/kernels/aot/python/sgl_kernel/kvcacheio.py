@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+import os
+from typing import List, Optional
 
 import torch
 
@@ -173,6 +174,23 @@ def transfer_kv_all_direct_lf_pf_D2H_hcu(
         start_layer_id,
         page_size,
     )
+
+def _default_mla_block_quota() -> int:
+    """CU (block) quota for the MLA page_first KV gather kernel.
+
+    Defaults to 16 on ROCm / 2 on CUDA. Override with the
+    SGLANG_HICACHE_BLOCK_QUOTA environment variable to tune how many CUs the
+    kernel is launched with.
+    """
+    default = 16 if _is_hip else 2
+    override = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
+    if override is None:
+        return default
+    try:
+        return int(override)
+    except ValueError:
+        return default
+
 
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
@@ -356,6 +374,19 @@ def transfer_kv_direct(
     )
 
 
+def transfer_embedding_ranges_direct(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_starts: List[int],
+    dst_starts: List[int],
+    lengths: List[int],
+) -> None:
+    """Copy embedding ranges between host and CUDA tensors."""
+    torch.ops.sgl_kernel.transfer_embedding_ranges_direct.default(
+        src, dst, src_starts, dst_starts, lengths
+    )
+
+
 def transfer_kv_per_layer_direct_pf_lf(
     src_ptrs: List[torch.Tensor],
     dst_ptrs: List[torch.Tensor],
@@ -387,9 +418,11 @@ def transfer_kv_per_layer_mla(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
-    block_quota: int = 2,
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
         src,
         dst,
@@ -409,9 +442,11 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 2,
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
         src,
         dst,

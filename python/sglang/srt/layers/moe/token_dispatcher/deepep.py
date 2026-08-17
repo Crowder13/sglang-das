@@ -517,6 +517,8 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.NORMAL
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -744,6 +746,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.LOW_LATENCY
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
