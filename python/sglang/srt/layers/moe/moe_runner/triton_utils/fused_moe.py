@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -123,6 +124,8 @@ num_cus = torch.cuda.get_device_properties(
 
 padding_size = get_moe_padding_size(_use_aiter)
 
+logger = logging.getLogger(__name__)
+
 
 class _CodePathChecker:
     def __init__(self):
@@ -167,6 +170,7 @@ def inplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
 ) -> None:
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
@@ -202,6 +206,7 @@ def inplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 
@@ -276,6 +281,7 @@ def outplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
 ) -> torch.Tensor:
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
@@ -311,6 +317,7 @@ def outplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 
@@ -375,6 +382,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -424,6 +432,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
         return hidden_states
     else:
@@ -458,6 +467,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
 
 
@@ -495,7 +505,7 @@ def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 
 @functools.lru_cache()
-def _down_moe_use_tma():
+def _moe_support_tma():
     return support_tensor_descriptor()
 
 
@@ -739,11 +749,26 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    down_moe_use_tma = (
-        _down_moe_use_tma()
-        and down_config is not None
-        and down_config.pop("USE_TMA", False)
-    )
+    # Copy config to avoid mutating the lru_cached dict returned by
+    # get_moe_configs; we pop USE_TMA below.
+    config = dict(config)
+    # Up-projection TMA is opt-in: only enabled when the up config file
+    # explicitly carries "USE_TMA": true (produced by tuning). By default the
+    # existing up config files do not contain this key, so existing users are
+    # unaffected unless they re-tune with the updated script.
+    up_tma_requested = config.pop("USE_TMA", False)
+    up_moe_use_tma = _moe_support_tma() and up_tma_requested
+    if up_moe_use_tma:
+        logger.warning_once(
+            "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "
+            "This requires a config produced by the updated tuning script. "
+        )
+    down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
+    down_moe_use_tma = _moe_support_tma() and down_tma_requested
+    if down_moe_use_tma:
+        logger.warning_once(
+            "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
+        )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
@@ -753,6 +778,7 @@ def _prepare_fused_moe_run(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -771,6 +797,7 @@ def _fused_moe_kernel_sequence(
     config: Dict[str, Any],
     down_config: Optional[Dict[str, Any]],
     down_moe_use_tma: bool,
+    up_moe_use_tma: bool,
     *,
     b1: Optional[torch.Tensor],
     b2: Optional[torch.Tensor],
@@ -799,6 +826,7 @@ def _fused_moe_kernel_sequence(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -868,17 +896,46 @@ def _fused_moe_kernel_sequence(
         and (not use_int4_w4a16)
     )
 
-    intermediate_cache1 = torch.empty(
-        (total_tokens, N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if fuse_swiglu_interleaved:
+        # W13 rows are physically interleaved (permuted once at load), so the
+        # activation MUST come from the fused up-GEMM epilogue -- a standalone
+        # activation kernel would read them as halves and be silently wrong.
+        # Fail loudly on an incompatible call rather than produce garbage.
+        assert (
+            activation == "silu"
+            and is_gated
+            and gemm1_alpha is None
+            and gemm1_limit is None
+            and swiglu_limit is None
+            and b1 is None
+            and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+            and not apply_router_weight_on_input
+            # LoRA injects its gate_up delta into the full-width pre-activation
+            # buffer that this path eliminates.
+            and hooks is None
+            and hidden_states.dtype == torch.bfloat16
+        ), "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+        # The epilogue applies silu(gate) * up in-register and writes the
+        # half-width activation directly, so intermediate_cache1 and the
+        # standalone activation launch are skipped entirely.
+        intermediate_cache1 = None
+        gemm1_out = intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    else:
+        gemm1_out = intermediate_cache1 = torch.empty(
+            (total_tokens, N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
     invoke_fused_moe_kernel(
         a1_q if a1_q is not None else hidden_states,
         w1,
         b1,
-        intermediate_cache1,
+        gemm1_out,
         a1_scale,
         w1_scale,
         w1_zp,
@@ -898,7 +955,9 @@ def _fused_moe_kernel_sequence(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
+        b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
+        fuse_swiglu=fuse_swiglu_interleaved,
     )
 
     if hooks and hooks.after_gate_up:
@@ -913,14 +972,18 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    intermediate_cache2 = torch.empty(
-        (total_tokens, N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if not fuse_swiglu_interleaved:
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
     # Activation function with multiplication
-    if activation == "silu" and is_gated:
+    if fuse_swiglu_interleaved:
+        # silu(gate) * up was already applied by the up-GEMM epilogue.
+        pass
+    elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
@@ -949,7 +1012,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+            assert (
+                _is_cuda or _is_hip or _is_xpu
+            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -959,8 +1024,8 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit_for_triton = swiglu_limit
                 else:
                     assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                        _is_cuda or _is_xpu
+                    ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2
@@ -1233,6 +1298,7 @@ def fused_experts_impl(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    fuse_swiglu_interleaved: bool = False,
 ):
     if (
         _use_aiter_moe
@@ -1289,6 +1355,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -1317,6 +1384,7 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         b1=b1,
         b2=b2,
         use_fp8_w8a8=use_fp8_w8a8,
@@ -1344,6 +1412,7 @@ def fused_experts_impl(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 
