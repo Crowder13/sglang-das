@@ -323,7 +323,7 @@ jobs:
 
       - name: Install build deps
         run: |
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin "ciupload==0.3.0"
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -363,7 +363,7 @@ jobs:
       - name: Build sgl-kernel (HIP)
         run: |
           source /opt/dtk/env.sh
-          cd sgl-kernel && python setup_hip.py bdist_wheel
+          cd python/sglang/kernels/aot && python setup_hip.py bdist_wheel
           echo "=== sgl-kernel wheel ==="
           ls -lh dist/*.whl
 
@@ -386,7 +386,7 @@ jobs:
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           mkdir -p output
           shopt -s nullglob
-          wheels=(sgl-kernel/dist/*.whl python/dist/*.whl)
+          wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl)
           if (( ${#wheels[@]} == 0 )); then
             echo "No HCU wheels were built" >&2
             exit 1
