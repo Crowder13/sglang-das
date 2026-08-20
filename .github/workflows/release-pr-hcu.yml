@@ -19,7 +19,7 @@ on:
       torch_version:
         description: 'PyTorch version to install'
         required: false
-        default: '2.11.0'
+        default: '2.10.0'
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
