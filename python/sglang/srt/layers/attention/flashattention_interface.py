@@ -79,10 +79,29 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     sinks=None,
     ver=3,
+    out=None,
 ):
+    if _is_hcu and _use_triton_vllm_fa and is_nmz_fp8(k_cache.dtype):
+        result = triton_vllm_flash_attn_with_kvcache(
+            q=q.contiguous().view(-1, max_seqlen_q, q.shape[-2], q.shape[-1]),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softcap=softcap,
+            return_softmax_lse=return_softmax_lse,
+        )
+        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
+
     k_cache = k_cache.to(q.dtype) if not is_nmz_fp8(k_cache.dtype) else k_cache
     v_cache = v_cache.to(q.dtype) if not is_nmz_fp8(k_cache.dtype) else v_cache
-    return flash_attn_with_kvcache_interface(
+    result = flash_attn_with_kvcache_interface(
             q=q.contiguous().view(-1, max_seqlen_q, q.shape[-2], q.shape[-1]),
             k_cache=k_cache,
             v_cache=v_cache,
@@ -95,6 +114,7 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
             num_splits=num_splits,
         )
+    return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
 def vllm_flash_attn_with_kvcache(
     q,

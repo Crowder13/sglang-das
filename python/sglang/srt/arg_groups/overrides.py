@@ -2301,7 +2301,11 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
 
 @register_post_process
 def _attention_backend_fa3_fp8_fallback(view: Any) -> dict:
-    if view.attention_backend == "fa3" and view.kv_cache_dtype == "fp8_e5m2":
+    if (
+        view.attention_backend == "fa3"
+        and view.kv_cache_dtype == "fp8_e5m2"
+        and not is_hcu()
+    ):
         logger.warning(
             "FlashAttention3 only supports fp8_e4m3 if using FP8; "
             "Setting attention backend to triton."
