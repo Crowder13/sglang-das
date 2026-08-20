@@ -21,7 +21,7 @@ from flash_attn import (
 )
 from flash_attn import (
     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
- )
+)
 
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
