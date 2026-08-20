@@ -20,11 +20,12 @@ from flash_attn import (
     vllm_flash_attn_varlen_func as vllm_flash_attn_varlen_func_interface,
 )
 from flash_attn import (
-     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
+    vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
  )
 
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
+
 _use_triton_vllm_fa = get_bool_env_var("SGLANG_USE_TRITON_VLLM_FA")
 _is_hcu = is_hcu()
 
@@ -175,7 +176,7 @@ def vllm_flash_attn_with_kvcache(
             softcap=softcap,
             return_softmax_lse=return_softmax_lse,
         )
-    
+
     return vllm_flash_attn_with_kvcache_interface(
         q=q,
         k_cache=k_cache,
