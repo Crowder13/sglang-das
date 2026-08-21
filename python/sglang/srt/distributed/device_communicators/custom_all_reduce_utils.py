@@ -374,7 +374,12 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                             return False
                     except AmdSmiException as error:
                         if _is_hcu:
-                            logger.error("HCU 1 hop HSL detection failed.")
+                            logger.error(
+                                "HCU 1 hop HSL topology query failed for "
+                                "device pair (%s, %s).",
+                                physical_device_ids[i],
+                                physical_device_ids[j],
+                            )
                         else:
                             logger.error(
                                 "ROCm/HIP 1 hop XGMI detection failed.",

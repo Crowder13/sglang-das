@@ -1,5 +1,4 @@
 # Approved HCU naming exceptions.
 # Format: repository path:line:approved literal
-.github/workflows/lint-hcu.yml:14:harbor.sourcefind.cn:5443/dcu/admin/base/dev
-.github/workflows/release-pr-hcu.yml:41:harbor.sourcefind.cn:5443/dcu/admin/base/dev
-.github/workflows/release-pypi-nightly-hcu.yml:50:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+# No active exceptions. Add an entry only after verifying that the literal still
+# exists at the recorded location and must remain unchanged.
