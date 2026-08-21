@@ -598,8 +598,8 @@ def main():
         "--nightly",
         action="store_true",
         help=(
-            "Include tests registered with nightly=True (AMD/CPU/NPU). CUDA "
-            "scheduled suites are selected by name and take no flag."
+            "Include tests registered with nightly=True. CUDA scheduled suites "
+            "are selected by name and take no flag."
         ),
     )
     parser.add_argument(
