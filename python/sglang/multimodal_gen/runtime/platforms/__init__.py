@@ -133,8 +133,9 @@ finally:
 
 
 def rocm_platform_plugin() -> str | None:
-    hcusmi_available = importlib.util.find_spec("hcusmi") is not None
+    hcusmi_available = False
     try:
+        hcusmi_available = importlib.util.find_spec("hcusmi") is not None
         if hcusmi_available:
             if _probe_hcusmi_device_count() > 0:
                 logger.info("ROCm platform is available via hcusmi")
