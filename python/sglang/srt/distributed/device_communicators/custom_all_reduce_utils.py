@@ -57,7 +57,10 @@ if _is_hip:
             amdsmi_topo_get_link_type,
         )
     except ImportError as e:
-        logger.warning("Failed to import ROCm SMI package with %r", e)
+        if _is_hcu:
+            logger.warning("Failed to import ROCm SMI package on HCU")
+        else:
+            logger.warning("Failed to import ROCm SMI package with %r", e)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -371,10 +374,7 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                             return False
                     except AmdSmiException as error:
                         if _is_hcu:
-                            logger.error(
-                                "HCU 1 hop HSL detection failed.",
-                                exc_info=error,
-                            )
+                            logger.error("HCU 1 hop HSL detection failed.")
                         else:
                             logger.error(
                                 "ROCm/HIP 1 hop XGMI detection failed.",

@@ -8899,9 +8899,14 @@ class ServerArgs:
                 if is_hip():
                     # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
-                    logger.info(
-                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
-                    )
+                    if is_hcu():
+                        logger.info(
+                            "HCU/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        )
+                    else:
+                        logger.info(
+                            "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        )
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
@@ -9099,9 +9104,14 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
                 or self.cuda_graph_config.prefill.backend != Backend.DISABLED
             ):
-                logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
-                )
+                if is_hcu():
+                    logger.warning(
+                        "Cuda graph is disabled for diffusion LLM inference on HCU"
+                    )
+                else:
+                    logger.warning(
+                        "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 

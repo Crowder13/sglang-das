@@ -133,8 +133,9 @@ finally:
 
 
 def rocm_platform_plugin() -> str | None:
+    hcusmi_available = importlib.util.find_spec("hcusmi") is not None
     try:
-        if importlib.util.find_spec("hcusmi") is not None:
+        if hcusmi_available:
             if _probe_hcusmi_device_count() > 0:
                 logger.info("ROCm platform is available via hcusmi")
                 return "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
@@ -154,7 +155,10 @@ def rocm_platform_plugin() -> str | None:
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.debug("ROCm platform is unavailable: %s", e)
+        if hcusmi_available:
+            logger.debug("ROCm SMI fallback is unavailable on HCU")
+        else:
+            logger.debug("ROCm platform is unavailable: %s", e)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
