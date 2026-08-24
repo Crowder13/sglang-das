@@ -2110,7 +2110,7 @@ class ServerArgs:
     ] = False
     pre_warm_nccl: A[
         bool,
-        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HCU/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         NS("exec.comm"),
     ] = False
     enable_quant_communications: A[
