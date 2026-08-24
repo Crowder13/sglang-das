@@ -2619,3 +2619,59 @@ After the fixes: **zero findings absent from both parents.**
 - Key module imports: 30 / 30.
 - `verify_hcu_registration.py`, `check_hcu_runtime_text.py`,
   `check_hcu_external_api_compat.py`: pass.
+
+**Post-merge fix: 29 dropped `environ.py` declarations (found at runtime).**
+
+The first launch died in decode CUDA-graph capture with
+`AttributeError: 'Envs' object has no attribute 'SGLANG_TOPK_TRANSFORM_512_TORCH'`
+(`dsv4/indexer.py:842`). Root cause: `environ.py` is a declaration list, and a
+plain 3-way merge silently drops every line only one side has. The symbol-diff
+rebuild had been applied to the *conflict region only*; 29 HCU-only knobs
+elsewhere in the class were dropped by the auto-merge, 8 of them still
+referenced (`SGLANG_TOPK_TRANSFORM_512_TORCH`, `SGLANG_OPT_FIX_MEGA_MOE_MEMORY`,
+`SGLANG_OPT_USE_FUSED_STORE_CACHE`, `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK`,
+`SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL`, `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS`,
+`SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND`, `SGLANG_NPU_FUSED_MOE_MODE`).
+No official declaration was lost. All 29 restored as one marked HCU block; three
+resulting duplicates removed.
+
+Ruff cannot see this class of bug -- `envs.X` is an attribute access, not an
+undefined name. **New gate, worth keeping:** diff the set of `envs.SGLANG_*`
+references against the set of `environ.py` declarations, and compare that set
+against *both* parents. After the fix the undeclared set is 7 on the merge and 7
+on each parent, i.e. no new dangling references.
+
+**Runtime validation: passed (agent-observed, 2026-08-24).**
+
+Environment `zz-nmz26` / `rye_sglang_0824`, a fresh container: `sgl-kernel` and
+`sglang` were built from this merge with `install_sglang.sh` (19 hipcc units,
+gfx906/926/928/936/938). The build itself exercised the kernel-side resolutions,
+including official's `kMultiChunk` template on `mega_moe_pre_dispatch.cuh` with
+the HIP-portable `SGL_GRID_CONSTANT` kept in place of `__grid_constant__`.
+
+Preflight: all eight cards idle (2 MiB) after two readings 90 s apart; earlier
+attempts were deferred while `zpc_minimax_0818` held ~56 GB/card.
+
+`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`
+(pure TP8, `mem_fraction_static=0.929`, `max_total_num_tokens=11830528`):
+
+| Check | Result |
+|---|---|
+| Server ready | yes, 16:17:57 |
+| Greedy sanity | `"The capital of France is **Paris**."` |
+| **GSM8K 100q** | **1.000** |
+| CUDA graph | active on decode (`cuda graph: True`) |
+| Aggregate decode throughput | up to 699.8 tok/s at 23 concurrent |
+| Faults | none -- no VMFault, illegal access, or scheduler exception |
+
+The only tracebacks in the log are four `post-warmup freeze_gc failed`
+`ConnectionRefused` traces: the freeze_gc call races Uvicorn's listener because
+`--skip-server-warmup` is set. Benign, pre-existing, not model-related.
+
+Note on the perf number: evalscope reports a *per-request* average (3.78 tok/s,
+32.2 s latency) that includes first-request JIT compilation in this fresh
+container, so it is not comparable with the 20260817 figure (13.1 tok/s) taken
+on an already-warm build. The server-side aggregate decode throughput above is
+the meaningful signal. A like-for-like perf comparison needs a warm re-run.
+
+All eight cards returned to 2 MiB after shutdown.
