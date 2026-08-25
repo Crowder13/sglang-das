@@ -7,4 +7,3 @@
 .github/workflows/release-pypi-nightly-hcu.yml:50:harbor.sourcefind.cn:5443/dcu/admin/base/dev
 .github/workflows/release-pypi-nightly-dcu.yml:65:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang
 .github/workflows/release-pypi-nightly-dcu.yml:214:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang
-python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/__init__.py:31:-DCUDA_ENABLED
