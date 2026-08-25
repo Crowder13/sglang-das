@@ -7,6 +7,24 @@ on:
   # ---- 临时 PR 触发，仅用于测试构建流程，测试完删除 ----
   pull_request:
 
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref, branch, tag, or SHA to build'
+        required: false
+        default: ''
+        type: string
+      torch_version:
+        description: 'PyTorch version to install'
+        required: false
+        default: '2.10.0'
+        type: string
+      skip_gateway:
+        description: 'Skip sgl-model-gateway build'
+        required: false
+        default: false
+        type: boolean
+
   # ---- 手动触发，可选任意 ref (分支 / tag / commit SHA) ----
   workflow_dispatch:
     inputs:
@@ -46,32 +64,27 @@ jobs:
         --security-opt seccomp=unconfined
         --privileged=true
 
+    # ---- Matrix: Python 版本 ----
     strategy:
       matrix:
         python-version: ['3.10']
 
     env:
       TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
-      SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
+      SKIP_GATEWAY: ${{ inputs.skip_gateway != false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
-      HCU_RUNNER_HOST_UID: ${{ vars.HCU_RUNNER_HOST_UID || '1000' }}
-      HCU_RUNNER_HOST_GID: ${{ vars.HCU_RUNNER_HOST_GID || '1000' }}
-      CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+      WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
 
     steps:
       # =======================================================================
       # 环境准备
       # =======================================================================
 
-      - name: Normalize workspace ownership before checkout
-        run: |
-          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
-
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.CHECKOUT_REF }}
+          ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
 
       - name: Resolve wheel commit SHA
@@ -83,7 +96,8 @@ jobs:
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
+          yum install -y perl-IPC-Cmd perl-Time-Piece
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -121,7 +135,7 @@ jobs:
           mv dtk-* dtk
 
       # =======================================================================
-      # 编译阶段: 手动触发, 忽略路径检测, 全量编译
+      # 编译阶段: 全量编译
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
@@ -156,7 +170,7 @@ jobs:
           ls -lh target/wheels/*.whl
 
       # =======================================================================
-      # 修复 (auditwheel) & 上传产物
+      # 修复 (auditwheel) & 归档产物
       # =======================================================================
 
       - name: Apply DAS local version to wheels
@@ -180,14 +194,9 @@ jobs:
           echo "=== Repaired wheels ==="
           ls -lh output/
 
-      - name: Upload wheel artifact
+      - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: hcu-wheels-${{ github.run_id }}
+          name: hcu-wheels-py${{ matrix.python-version }}
           path: output/*.whl
-          retention-days: 30
-
-      - name: Normalize workspace ownership
-        if: always()
-        run: |
-          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+          if-no-files-found: warn
