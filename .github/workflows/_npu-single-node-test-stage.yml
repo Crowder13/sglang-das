@@ -44,8 +44,8 @@ on:
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
       skip_pr_test_health_check:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
-        type: string
-        default: 'false'
+        type: boolean
+        default: false
       is_nightly_pipeline_job:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
