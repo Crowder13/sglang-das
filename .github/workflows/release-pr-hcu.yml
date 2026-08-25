@@ -79,6 +79,7 @@ jobs:
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
