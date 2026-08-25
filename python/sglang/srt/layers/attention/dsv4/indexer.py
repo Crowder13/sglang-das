@@ -600,10 +600,7 @@ class C4IndexerBackendMixin:
         ks = torch.zeros_like(ke)
         # SGL Top-K synthesizes sequential indices for trivial rows without
         # reading logits, so DeepGEMM can receive an empty range for them.
-        if (
-            self.dsa_topk_backend.is_sgl_kernel()
-            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
-        ):
+        if self.dsa_topk_backend.is_sgl_kernel():
             ke = torch.where(ke - ks > c4_indexer.index_topk, ke, ks)
         c4_page_size = indexer_metadata.c4_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size

@@ -1211,16 +1211,9 @@ inline void transfer_kv_page_first_direct_impl(
   };
 
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
-#if defined(USE_ROCM)
-  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); disabled by
-  // default, falls back to per-page copy below.
-  //
-  // HCU: `kEnableHipBatch` is a plain runtime `if`, so the body below is still
-  // compiled even though the flag is false, and `hipMemcpyBatchAsync` only
-  // exists from HIP 7.0.  DTK 26.04 ships HIP 6.3, where the symbol is
-  // undeclared and the translation unit fails to build, so gate the whole
-  // block on the HIP version instead of relying on the runtime flag.
-#if defined(HIP_VERSION) && HIP_VERSION >= 70000000
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70200000
+  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); requires
+  // ROCm >= 7.2.  Disabled by default, falls back to per-page copy below.
   constexpr bool kEnableHipBatch = false;
   if (kEnableHipBatch) {
     std::vector<void*> b_srcs, b_dsts;
@@ -1289,8 +1282,7 @@ inline void transfer_kv_page_first_direct_impl(
     }
     return;
   }
-#endif  // HIP_VERSION >= 7.0
-#endif  // USE_ROCM
+#endif  // USE_ROCM && HIP_VERSION >= 7.2
   fallback_to_page_copy();
   return;
 

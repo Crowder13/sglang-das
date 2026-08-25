@@ -76,7 +76,7 @@ register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 # Mock TokenizerManager for embedding tests
