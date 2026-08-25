@@ -500,7 +500,7 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -748,6 +748,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         experts.mega_l2_weights = l2_pair
 
     experts._mega_moe_weights_built = True
+
 
 
 def _hcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tensor:

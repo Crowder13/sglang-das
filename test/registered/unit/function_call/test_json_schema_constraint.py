@@ -36,7 +36,7 @@ register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small", disabled='HCU Ful
 
 
 register_cpu_ci(5, "base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):
