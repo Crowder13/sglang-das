@@ -5,7 +5,7 @@ permissions:
   pull-requests: read
 
 on:
-  pull_request:
+  pull_request_target:
     paths:
       - 'python/**'
       - 'python/sglang/kernels/aot/**'
@@ -31,7 +31,7 @@ jobs:
   compile:
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
     concurrency:
-      group: release-pr-hcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-pr-hcu-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, hcu, nmz4]
@@ -75,8 +75,10 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
+          persist-credentials: false
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
