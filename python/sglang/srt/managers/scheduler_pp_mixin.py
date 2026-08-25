@@ -51,8 +51,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.model_executor.input_buffers import get_pp_proxy_hidden_states_shape
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
@@ -864,7 +864,6 @@ class SchedulerPPMixin:
                     pp_bad_rids=bad_consensus_bootstrapped_rids,
                 )
             )
-
 
             # if ready_reqs:
             #     self._try_send_prefill_kv_ready_batch(ready_reqs)

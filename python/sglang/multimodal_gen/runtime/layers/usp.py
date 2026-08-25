@@ -916,6 +916,7 @@ def _ring_attention_varlen(
             cur = nxt
     return out_acc.to(q.dtype)
 
+
 def ring_attn_overlap(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -942,7 +943,10 @@ def ring_attn_overlap(
         is_causal: Whether to apply causal masking.
         dropout_p: Dropout probability.
     """
-    from sglang.multimodal_gen.runtime.layers.ring_attention import _templated_ring_attention_overlap as _templated_ring_attention
+    from sglang.multimodal_gen.runtime.layers.ring_attention import (
+        _templated_ring_attention_overlap as _templated_ring_attention,
+    )
+
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
 

@@ -43,6 +43,10 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -58,7 +62,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+    flash_mla_with_kvcache_entrypoint,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -80,14 +88,6 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_lightop,
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
-from sglang.srt.layers.attention.debug_flash_mla_adapter import (
-    flash_mla_with_kvcache_entrypoint,
-)
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -173,9 +173,13 @@ T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
-    return not _is_sm120 and not dsa_use_prefill_cp(forward_batch) and (
-        q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    return (
+        not _is_sm120
+        and not dsa_use_prefill_cp(forward_batch)
+        and (
+            q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
     )
 
 
@@ -399,9 +403,9 @@ class DSV4AttnMetadata:
             num_tokens = pre_global_len
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
+            assert isinstance(
+                val, torch.Tensor
+            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
@@ -578,9 +582,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert head_dim == 512, (
-            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-        )
+        assert (
+            head_dim == 512
+        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -1942,13 +1946,13 @@ class DeepseekV4AttnBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert swa_page_indices.shape[-1] % 64 == 0, (
-                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
-            )
+            assert (
+                swa_page_indices.shape[-1] % 64 == 0
+            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
             if extra_indices is not None:
-                assert extra_indices.shape[-1] % 64 == 0, (
-                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
-                )
+                assert (
+                    extra_indices.shape[-1] % 64 == 0
+                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             if not _is_hcu:
                 if q.ndim == 3:

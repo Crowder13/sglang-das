@@ -14,9 +14,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
-import os
 
 import torch
 import triton
@@ -69,9 +69,9 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
-    is_hcu,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hcu,
     is_xpu,
     next_power_of_2,
 )
@@ -289,8 +289,10 @@ class TritonAttnBackend(AttentionBackend):
                     ).shape[-1]
                 except KeyError:
                     # PP mode: this stage may not own the queried layer
-                    self.v_head_dim = getattr(model_runner.token_to_kv_pool, 'v_head_dim', None) or \
-                        model_runner.token_to_kv_pool.full_kv_pool.v_head_dim
+                    self.v_head_dim = (
+                        getattr(model_runner.token_to_kv_pool, "v_head_dim", None)
+                        or model_runner.token_to_kv_pool.full_kv_pool.v_head_dim
+                    )
 
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -659,9 +661,7 @@ class TritonAttnBackend(AttentionBackend):
         ):
             extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
         else:
-            extend_seq_lens = torch.zeros(
-                bs, dtype=torch.int32, device=seq_lens.device
-            )
+            extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=seq_lens.device)
         kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(torch.int32)
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
