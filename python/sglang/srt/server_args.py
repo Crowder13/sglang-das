@@ -30,10 +30,11 @@ import random
 import socket
 import tempfile
 import uuid
+from typing import Annotated as A
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
+from sglang.srt.arg_groups.arg_utils import NS, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -224,7 +225,8 @@ HCU_DSA_PREFILL_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv", "flashmla_a
 HCU_DSA_DECODE_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv"}
 HCU_GENERIC_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e5m2"}
 HCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES = {
-    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES, "fp8_e4m3"
+    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES,
+    "fp8_e4m3",
 }
 HCU_DSA_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e4m3"}
 HCU_DSV4_KV_CACHE_DTYPE_CHOICES = HCU_DSA_KV_CACHE_DTYPE_CHOICES
@@ -1923,10 +1925,14 @@ class ServerArgs:
         NS("exec.kernel"),
     ] = "auto"
     pack_paged_kv_to_varlen_min_kv_tokens: A[
-        int, "Minimum total KV tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum total KV tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 16384
     pack_paged_kv_to_varlen_min_q_tokens: A[
-        int, "Minimum query tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum query tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 8192
     mamba_backend: A[
         str,
