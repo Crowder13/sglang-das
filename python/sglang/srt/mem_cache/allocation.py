@@ -619,9 +619,7 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_hcu and get_bool_env_var(
-        "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true"
-    ):
+    if _is_hcu and get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true"):
         hcu_assign_req_to_token_pool(
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,

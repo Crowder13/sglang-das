@@ -55,15 +55,16 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
     is_cuda,
     is_cuda_alike,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_musa,
-    is_hcu,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -72,7 +73,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
-from sglang.srt.utils import get_bool_env_var
 _use_fused_reshape_to_float = get_bool_env_var("SGLANG_USE_FUSED_RESHAPE_TO_FLOAT")
 
 _is_npu = is_npu()
@@ -430,7 +430,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            dispatch_custom_allreduce
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -1092,7 +1092,9 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            with pynccl_comm.change_state(enable=True, stream=get_current_device_stream_fast()):
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
                 pynccl_comm.all_to_all_single(output, input)
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
@@ -1368,11 +1370,18 @@ class GroupCoordinator:
 
         if _is_hcu and _use_fused_reshape_to_float:
             from lightop import op
-            vocab_size = input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+
+            vocab_size = (
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
             output_tensor = op.reshape_to_float(output_tensor, vocab_size[1])
         else:
             output_tensor = output_tensor.reshape(
-                input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
             )
         return output_tensor
 

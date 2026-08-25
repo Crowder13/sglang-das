@@ -37,9 +37,7 @@ from triton.language.extra import libdevice
 
 from sglang.srt.utils import get_bool_env_var
 
-use_groupgemm = get_bool_env_var(
-    "SGLANG_GROUPGEMM", default="true"
-)
+use_groupgemm = get_bool_env_var("SGLANG_GROUPGEMM", default="true")
 
 
 def _get_launch_config_1d(device, numel):
@@ -1095,7 +1093,9 @@ def _fwd_kernel_ep_scatter_1_fused(
     for offset in range(0, numel, BLOCK):
         offs = offset + tl.arange(0, BLOCK)
         mask = offs < numel
-        val = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
+        val = tl.load(
+            topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last"
+        )
         count = count + tl.sum((val == cur_expert).to(tl.int32) & mask)
 
     rng = tl.arange(0, BLOCK_EXPERT_NUM)
@@ -1265,9 +1265,7 @@ def _fwd_kernel_ep_scatter_non_quant(
         activation = tl.load(x_ptr, mask=mask_hidden)
 
         for topk_idx in range(topk_num):
-            expert_id = tl.load(
-                recv_topk + token_id * recv_topk_stride0 + topk_idx
-            )
+            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_idx)
             if expert_id >= 0:
                 dest_idx_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
                 dest_idx = dest_idx_int32.to(tl.int64)
@@ -1279,6 +1277,7 @@ def _fwd_kernel_ep_scatter_non_quant(
 
                 out_ptr = output_tensor + dest_idx * output_tensor_stride0 + offs_hidden
                 tl.store(out_ptr, activation, mask=mask_hidden)
+
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
 @torch.no_grad()
@@ -1313,13 +1312,13 @@ def ep_scatter_no_scale(
     _fwd_kernel_ep_scatter_non_quant[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,
-        recv_x,              # e.g., bfloat16
+        recv_x,  # e.g., bfloat16
         recv_x.stride(0),
         recv_x.stride(1),
-        recv_topk,           # int32
+        recv_topk,  # int32
         recv_topk.stride(0),
         recv_topk.stride(1),
-        output_tensor,       # same dtype as recv_x
+        output_tensor,  # same dtype as recv_x
         output_tensor.stride(0),
         output_tensor.stride(1),
         output_index,
@@ -1431,6 +1430,7 @@ def ep_scatter(
     )
     return
 
+
 @triton.jit
 def count_expert_histogram_kernel(
     topk_ids_ptr,
@@ -1494,7 +1494,9 @@ def fused_build_m_indices_kernel(
         for offset in range(0, numel, BLOCK):
             offs = offset + tl.arange(0, BLOCK)
             mask = offs < numel
-            val = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
+            val = tl.load(
+                topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last"
+            )
             count = count + tl.sum((val == pid).to(tl.int32) & mask)
 
         rng = tl.arange(0, E)
@@ -1727,10 +1729,12 @@ def build_m_indices_kernel(
 
     expert = tl.zeros([BLOCK], dtype=tl.int32)
     for i in range(0, MAX_E):
-        ps = tl.load(prefix_slots_ptr + i, mask=i < E, other=2 ** 30)
+        ps = tl.load(prefix_slots_ptr + i, mask=i < E, other=2**30)
         expert += slot_id >= ps
 
-    start_slot = tl.where(expert > 0, tl.load(prefix_slots_ptr + expert - 1, mask=expert > 0, other=0), 0)
+    start_slot = tl.where(
+        expert > 0, tl.load(prefix_slots_ptr + expert - 1, mask=expert > 0, other=0), 0
+    )
 
     rel_slot = slot_id - start_slot
     pos_in_slot = offs & 0xFF
@@ -2587,6 +2591,8 @@ def fp8_per_token_to_per_tensor_quant_triton(
         HAS_K_TAIL=x.size(2) % K_BLOCK_SIZE != 0,
         num_warps=8,
     )
+
+
 @triton.jit
 def _per_token_quant_int8_one_kernel_opt(
     x_ptr,
@@ -2597,7 +2603,7 @@ def _per_token_quant_int8_one_kernel_opt(
     N,
     T_dim,
     tokens_per_expert_ptr,
-    BLOCK: tl.constexpr
+    BLOCK: tl.constexpr,
 ):
     row_id = tl.program_id(0)
 
@@ -2613,8 +2619,7 @@ def _per_token_quant_int8_one_kernel_opt(
     cols = tl.arange(0, BLOCK)
     mask = cols < N
 
-    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask,
-                other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
@@ -2622,6 +2627,7 @@ def _per_token_quant_int8_one_kernel_opt(
 
     tl.store(xq_ptr + row_id * stride_xq + cols, x_q, mask=mask)
     tl.store(scale_ptr + row_id, scale_x)
+
 
 @triton.jit
 def _per_token_quant_int8_kernel_opt(
@@ -2634,7 +2640,7 @@ def _per_token_quant_int8_kernel_opt(
     E_dim,
     T_dim,
     tokens_per_expert_ptr,
-    BLOCK: tl.constexpr
+    BLOCK: tl.constexpr,
 ):
     token_idx_start = tl.program_id(0)
     grid_size = tl.num_programs(0)
@@ -2656,8 +2662,9 @@ def _per_token_quant_int8_kernel_opt(
             cols = tl.arange(0, BLOCK)
             mask = cols < N
 
-            x = tl.load(x_ptr + token_idx * stride_x + cols, mask=mask,
-                        other=0.0).to(tl.float32)
+            x = tl.load(x_ptr + token_idx * stride_x + cols, mask=mask, other=0.0).to(
+                tl.float32
+            )
             absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
             scale_x = absmax / 127
             x_q = x * (127 / absmax)
@@ -2667,15 +2674,16 @@ def _per_token_quant_int8_kernel_opt(
             tl.store(scale_ptr + token_idx, scale_x)
 
 
-def per_token_quant_int8_triton_opt(x: torch.Tensor,
-                                    tokens_per_expert: Optional[torch.Tensor] = None):
+def per_token_quant_int8_triton_opt(
+    x: torch.Tensor, tokens_per_expert: Optional[torch.Tensor] = None
+):
     if x.dim() != 3:
         raise ValueError(f"Input must be 3D [E, T, H], but got {x.shape}")
     E, T, H = x.shape
     N = H
 
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
-    scales = torch.empty(x.shape[:-1] + (1, ), device=x.device, dtype=torch.float32)
+    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
     num_warps = min(max(BLOCK // 256, 1), 8)
     if (E == 8 and T >= 1024) or (E == 16 and T >= 512):
@@ -2686,7 +2694,7 @@ def per_token_quant_int8_triton_opt(x: torch.Tensor,
 
     if (E == 8 and T >= 1024) or (E == 16 and T >= 512):
         grid_opt = max(1, num_tokens // (T // 256))
-        _per_token_quant_int8_kernel_opt[(grid_opt, )](
+        _per_token_quant_int8_kernel_opt[(grid_opt,)](
             x,
             x_q,
             scales,
@@ -2701,7 +2709,7 @@ def per_token_quant_int8_triton_opt(x: torch.Tensor,
             num_stages=1,
         )
     else:
-        _per_token_quant_int8_one_kernel_opt[(grid_opt, )](
+        _per_token_quant_int8_one_kernel_opt[(grid_opt,)](
             x,
             x_q,
             scales,

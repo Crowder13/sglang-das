@@ -61,8 +61,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     is_cpu,
-    is_hcu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_npu,
     support_triton,

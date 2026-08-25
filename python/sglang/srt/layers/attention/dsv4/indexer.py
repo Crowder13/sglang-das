@@ -63,9 +63,7 @@ if TYPE_CHECKING:
 
 
 _is_hcu = is_hcu()
-_is_aiter_fp8_paged_mqa_logits_supported = (
-    is_gfx942_supported() or is_gfx95_supported()
-)
+_is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 

@@ -1373,5 +1373,3 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
-
-

@@ -292,6 +292,7 @@ def build_tree_kernel_efficient(
         draft_tokens,
     )
 
+
 def sgl_build_tree_kernel_triton(
     parent_list: torch.Tensor,
     selected_index: torch.Tensor,

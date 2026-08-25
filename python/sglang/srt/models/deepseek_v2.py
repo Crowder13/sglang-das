@@ -186,11 +186,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_gfx95_supported,
+    _is_hcu,
     _is_hip,
     _is_musa,
     _is_npu,
     _is_xpu,
-    _is_hcu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -310,9 +310,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -811,8 +809,7 @@ class DeepseekV2MoE(nn.Module):
                 config_quantization = getattr(config, "quantization_config", None)
                 is_compressed_tensors = (
                     isinstance(config_quantization, dict)
-                    and config_quantization.get("quant_method")
-                    == "compressed-tensors"
+                    and config_quantization.get("quant_method") == "compressed-tensors"
                 ) or (
                     self.shared_experts.gate_up_proj.quant_method.__class__.__module__.startswith(
                         "sglang.srt.layers.quantization.compressed_tensors"

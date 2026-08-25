@@ -313,7 +313,7 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             ),
         )
-    
+
     def _create_hcumla_decode_backend(self):
         from sglang.srt.layers.attention.hcu_mla_backend import (
             HCUMLAMultiStepDraftBackend,

@@ -78,8 +78,8 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
-    Backend,
     MAX_SCHEDULER_RPC_TIMEOUT_S,
+    Backend,
     ServerArgs,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser

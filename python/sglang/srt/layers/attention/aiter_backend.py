@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_hcu, is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_hcu
 
 _is_hcu = is_hcu()
 

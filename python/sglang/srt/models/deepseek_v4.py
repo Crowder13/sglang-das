@@ -149,10 +149,10 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
     _is_cuda,
+    _is_hcu,
     _is_hip,
     _is_npu,
     _is_xpu,
-    _is_hcu,
 )
 from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
@@ -878,9 +878,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         self.use_fused_qk_norm_rope = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
         # KV cache write is always fused into the K kernel
@@ -1916,9 +1914,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
             # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
             # contract so the caller still applies input_layernorm on HCU.
-            norm_fused = norm is not None and not (
-                _is_hcu and _use_aiter_tilelang_mhc
-            )
+            norm_fused = norm is not None and not (_is_hcu and _use_aiter_tilelang_mhc)
             return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip:
@@ -3742,8 +3738,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 name = name.replace("weight_packed", "weight")
                             resolved_name = name.replace(weight_name, param_name)
                             if resolved_name not in params_dict:
-                                resolved_name = maybe_remap_compressed_tensors_scale_name(
-                                    resolved_name
+                                resolved_name = (
+                                    maybe_remap_compressed_tensors_scale_name(
+                                        resolved_name
+                                    )
                                 )
                             if resolved_name not in params_dict:
                                 skip_unmaterialized_expert_param = True
@@ -3844,8 +3842,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     fused_weight = torch.cat(
                                         [bucket["q"], bucket["kv"]], dim=0
                                     )
-                                    param_name = maybe_remap_compressed_tensors_scale_name(
-                                        param_name
+                                    param_name = (
+                                        maybe_remap_compressed_tensors_scale_name(
+                                            param_name
+                                        )
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
@@ -3869,7 +3869,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    name = maybe_remap_compressed_tensors_scale_name(name)
+                                    name = maybe_remap_compressed_tensors_scale_name(
+                                        name
+                                    )
                                 if name not in params_dict:
                                     if not name.startswith("mtp"):
                                         logger.warning(

@@ -21,7 +21,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hcu,

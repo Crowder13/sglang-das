@@ -114,7 +114,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
-    is_hcu,
     is_hip,
     is_npu,
     is_xpu,
