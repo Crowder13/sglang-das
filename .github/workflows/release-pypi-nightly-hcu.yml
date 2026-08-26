@@ -204,3 +204,9 @@ jobs:
           name: hcu-wheels-py${{ matrix.python-version }}
           path: output/*.whl
           if-no-files-found: warn
+
+      # 容器 job 以 root 运行, 会在共享 workspace 留下 root 文件,
+      # 导致同机器上其他 job 的 checkout 失败; 跑完清掉
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
