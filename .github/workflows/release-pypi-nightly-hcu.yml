@@ -4,13 +4,8 @@ permissions:
   contents: read
 
 on:
-  pull_request_target:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - labeled
-      - ready_for_review
+  # ---- 合入 release 分支后触发 ----
+  push:
     branches:
       - release/20260825_v0.5.18
 
@@ -132,6 +127,7 @@ jobs:
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
+        if: false  # DEBUG: 临时跳过，只编 router
         run: |
           source /opt/dtk/env.sh
           cd python/sglang/kernels/aot && python setup_hip.py bdist_wheel
@@ -139,7 +135,7 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sglang python package
-        if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
+        if: false  # DEBUG: 临时跳过，只编 router
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: "0.5.15.post1"
         run: |
@@ -158,10 +154,19 @@ jobs:
           source $HOME/.cargo/env
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+          echo "DEBUG pwd=$(pwd) GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel
+          echo "DEBUG after cargo pwd=$(pwd)"
+          maturin build --manifest-path bindings/python/Cargo.toml --release --skip-auditwheel
+          echo "DEBUG after maturin pwd=$(pwd)"
+          echo "DEBUG ls target/wheels (relative):"
+          ls -la target/wheels/ 2>&1 || true
+          echo "DEBUG ls workspace path:"
+          ls -la "$GITHUB_WORKSPACE/sgl-model-gateway/target/wheels/" 2>&1 || true
+          echo "DEBUG find wheels:"
+          find "$GITHUB_WORKSPACE" -name "*.whl" 2>/dev/null
           echo "=== sgl-model-gateway wheel ==="
-          ls -lh ../target/wheels/*.whl
+          ls -lh "$GITHUB_WORKSPACE/sgl-model-gateway/target/wheels/"*.whl 2>&1 || true
 
       # =======================================================================
       # 修复 (auditwheel) & 上传产物
