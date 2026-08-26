@@ -4,13 +4,8 @@ permissions:
   contents: read
 
 on:
-  pull_request_target:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - labeled
-      - ready_for_review
+  # ---- 合入 release 分支后触发 ----
+  push:
     branches:
       - release/20260825_v0.5.18
 
