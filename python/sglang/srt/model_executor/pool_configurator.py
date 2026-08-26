@@ -404,7 +404,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker):
                 active_indexer_layers = get_dsa_full_indexer_layer_ids(
                     kvc.model_config.hf_config,
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
                 )
             else:
                 active_indexer_layers = list(
