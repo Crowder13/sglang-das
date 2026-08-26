@@ -181,6 +181,7 @@ QUANTIZATION_CHOICES = [
     "unquant",
     "slimquant_marlin",
     "humming",
+    "slimquant_w4a8_marlin",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -211,6 +212,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "hcu_mla",
 ]
 
 HCU_ATTENTION_BACKEND_CHOICES = {
@@ -255,6 +257,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "hcu_mla"
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
