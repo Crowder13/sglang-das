@@ -11,6 +11,12 @@ on:
 
   # ---- 手动触发，仅构建产物，不上传 NIGHTLY ----
   workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的 Git ref/branch/tag/SHA，默认当前分支 HEAD'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   compile:
@@ -43,7 +49,7 @@ jobs:
       PIP_INDEX_URL: ${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
       DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
-      WHEEL_COMMIT_SHA: ${{ github.sha }}
+      WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
 
     steps:
       # =======================================================================
