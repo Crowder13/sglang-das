@@ -99,6 +99,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    resolve_disagg_metadata_config,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -1345,11 +1346,11 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.pp_size != 1:
+            if self.ps.pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
+            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports attn_tp_size=1 and "
                     "attn_cp_size=1 only"
@@ -1357,7 +1358,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.server_args.dp_size * self.attn_tp_size * self.attn_cp_size
+                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1384,7 +1385,7 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "
                     "group, world=%s timeout=%.1fs",
@@ -1425,6 +1426,29 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # DSpark PD hidden-state transfer widens the metadata buffers and adds
+        # its own receive pool. NULL mode has no PD wire to size, and resolving
+        # it there would inspect speculative workers that need not exist.
+        metadata_buffer_kwargs = {}
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            disagg_metadata_config = resolve_disagg_metadata_config(
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                disaggregation_mode=self.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+                spec_algorithm=self.spec_algorithm,
+                model_config=self.model_config,
+                server_args=self.server_args,
+                model_runner=self.tp_worker.model_runner,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                gpu_id=self.ps.gpu_id,
+                max_prefill_tokens=self.max_prefill_tokens,
+            )
+            disagg_hidden_size = disagg_metadata_config.hidden_size
+            disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+            metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1447,6 +1471,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             # The decode requests polling kv cache
@@ -1493,6 +1518,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
