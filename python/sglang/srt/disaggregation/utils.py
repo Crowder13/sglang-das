@@ -1108,6 +1108,10 @@ def setup_state_kv_args(
                 if isinstance(token_to_kv_pool, DSATokenToKVPool)
                 else ""
             )
+            has_state_layer_ids = hasattr(token_to_kv_pool, "get_state_layer_ids")
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids() if has_state_layer_ids else []
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1119,6 +1123,14 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
+                if has_state_layer_ids:
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "total_kv_layers is required for DSA draft state metadata"
+                        )
+                    state_layer_ids += [
+                        total_kv_layers + i for i in range(len(draft_data_ptrs))
+                    ]
                 draft_data_format = (
                     draft_token_to_kv_pool.get_index_k_cache_transfer_abi()
                 )
@@ -1139,6 +1151,7 @@ def setup_state_kv_args(
                     data_ptrs,
                     data_lens,
                     item_lens,
+                    layer_ids=state_layer_ids,
                     data_format=data_format,
                 )
 

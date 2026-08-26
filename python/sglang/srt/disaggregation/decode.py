@@ -512,6 +512,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        has_kv_layer_ids = hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+        kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids() if has_kv_layer_ids else []
+        )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
@@ -538,16 +542,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+            if has_kv_layer_ids:
+                target_layer_num = self.scheduler.model_config.num_hidden_layers
+                kv_layer_ids += [
+                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
+                ]
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
-        )
+        kv_args.kv_layer_ids = kv_layer_ids
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size

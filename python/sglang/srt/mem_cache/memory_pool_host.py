@@ -1480,7 +1480,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    self.target_layer_num + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )
