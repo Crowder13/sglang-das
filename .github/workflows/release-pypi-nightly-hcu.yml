@@ -45,6 +45,9 @@ jobs:
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
 
     container:
       image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
