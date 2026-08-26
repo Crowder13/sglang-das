@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+import importlib
 import os
 from typing import Dict, List, Optional
 
@@ -39,79 +39,75 @@ from sglang.srt.utils import set_weight_attrs
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 
-logger = logging.getLogger(__name__)
-
 W4A8_TPMOE_BACKEND_ENV = "SGLANG_W4A8_TPMOE_BACKEND"
 W4A8_TPMOE_BACKEND_AUTO = "auto"
 W4A8_TPMOE_BACKEND_LIGHTOP = "lightop"
 W4A8_TPMOE_BACKEND_AITER = "aiter"
-_requested_backend = (
-    os.getenv(W4A8_TPMOE_BACKEND_ENV, W4A8_TPMOE_BACKEND_AUTO).strip().lower()
-)
+_resolved_backend: Optional[str] = None
 
 
-_lmslim_w4a8_marlin_available = False
-_aiter_w4a8_marlin_available = False
+def _resolve_backend() -> str:
+    global _resolved_backend
 
-if _requested_backend in {W4A8_TPMOE_BACKEND_AUTO, W4A8_TPMOE_BACKEND_LIGHTOP}:
-    try:
-        from lightop.moe import (
-            fused_experts_impl_w4a8_marlin,
-        )
+    if _resolved_backend is not None:
+        return _resolved_backend
 
-        _lmslim_w4a8_marlin_available = True
-    except Exception:
-        logger.info(
-            "INFO: Please install lightop if you want to infer the quantitative model of moe.\n"
-        )
-
-if _requested_backend in {W4A8_TPMOE_BACKEND_AUTO, W4A8_TPMOE_BACKEND_AITER}:
-    try:
-        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
-        from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
-
-        _aiter_w4a8_marlin_available = True
-    except Exception:
-        pass
-
-if _requested_backend not in {
-    W4A8_TPMOE_BACKEND_AUTO,
-    W4A8_TPMOE_BACKEND_LIGHTOP,
-    W4A8_TPMOE_BACKEND_AITER,
-}:
-    raise ValueError(
-        f"Unsupported {W4A8_TPMOE_BACKEND_ENV}={_requested_backend!r}. "
-        f"Supported values: {W4A8_TPMOE_BACKEND_AUTO!r}, "
-        f"{W4A8_TPMOE_BACKEND_LIGHTOP!r}, {W4A8_TPMOE_BACKEND_AITER!r}."
+    requested_backend = (
+        os.getenv(W4A8_TPMOE_BACKEND_ENV, W4A8_TPMOE_BACKEND_AUTO).strip().lower()
     )
-
-if _requested_backend == W4A8_TPMOE_BACKEND_AUTO:
-    if _lmslim_w4a8_marlin_available:
-        _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
-    elif _aiter_w4a8_marlin_available:
-        _resolved_backend = W4A8_TPMOE_BACKEND_AITER
-    else:
-        raise RuntimeError(
-            "Neither lightop nor aiter backend is available for w4a8 tpmoe."
+    if requested_backend not in {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_LIGHTOP,
+        W4A8_TPMOE_BACKEND_AITER,
+    }:
+        raise ValueError(
+            f"Unsupported {W4A8_TPMOE_BACKEND_ENV}={requested_backend!r}. "
+            f"Supported values: {W4A8_TPMOE_BACKEND_AUTO!r}, "
+            f"{W4A8_TPMOE_BACKEND_LIGHTOP!r}, {W4A8_TPMOE_BACKEND_AITER!r}."
         )
-elif _requested_backend == W4A8_TPMOE_BACKEND_LIGHTOP:
-    if not _lmslim_w4a8_marlin_available:
+
+    lightop_error = None
+    if requested_backend in {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_LIGHTOP,
+    }:
+        try:
+            lightop_moe = importlib.import_module("lightop.moe")
+            getattr(lightop_moe, "fused_experts_impl_w4a8_marlin")
+        except Exception as error:
+            lightop_error = error
+        else:
+            _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
+
+    aiter_error = None
+    if _resolved_backend is None and requested_backend in {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_AITER,
+    }:
+        try:
+            aiter_moe_module = importlib.import_module("aiter.moe")
+            for symbol in ("MoeQuantType", "aiter_moe", "get_aiter_moe_config"):
+                getattr(aiter_moe_module, symbol)
+            aiter_shuffle = importlib.import_module("aiter.ops.shuffle")
+            getattr(aiter_shuffle, "w4a8_moe_layout_shuffle_gemm2")
+        except Exception as error:
+            aiter_error = error
+        else:
+            _resolved_backend = W4A8_TPMOE_BACKEND_AITER
+
+    if _resolved_backend is not None:
+        return _resolved_backend
+    if requested_backend == W4A8_TPMOE_BACKEND_LIGHTOP:
         raise RuntimeError(
             "lightop backend is selected for w4a8 tpmoe, but lightop is not available."
-        )
-    _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
-else:
-    if not _aiter_w4a8_marlin_available:
+        ) from lightop_error
+    if requested_backend == W4A8_TPMOE_BACKEND_AITER:
         raise RuntimeError(
             "aiter backend is selected for w4a8 tpmoe, but aiter is not available."
-        )
-    _resolved_backend = W4A8_TPMOE_BACKEND_AITER
-
-logger.info(
-    "[slimquant_w4a8_marlin] "
-    f"requested_backend={_requested_backend}, "
-    f"resolved_backend={_resolved_backend}"
-)
+        ) from aiter_error
+    raise RuntimeError(
+        "Neither lightop nor aiter backend is available for w4a8 tpmoe."
+    ) from (aiter_error or lightop_error)
 
 
 class MarlinMoeWorkspace:
@@ -150,6 +146,8 @@ def repack_and_shuffle_w4a8(weight_data, E):
     逐 expert 处理 [n, k_half]
     处理完直接写回 weight_data[i]
     """
+    from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
+
     # 原始 shape: [E, n, k_half]
     for i in range(E):
         # 1. 取当前 expert [n, k_half]
@@ -245,7 +243,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if _resolved_backend == W4A8_TPMOE_BACKEND_AITER:
+            if _resolve_backend() == W4A8_TPMOE_BACKEND_AITER:
                 return SlimQuantW4A8Int8AiterMoEMethod(self)
             return SlimQuantW4A8Int8MarlinMoEMethod(self)
         return None
@@ -280,8 +278,11 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         return super().__new__(cls)
 
     def __init__(self, quant_config):
+        from lightop.moe import fused_experts_impl_w4a8_marlin
+
         self.quant_config = quant_config
         self.use_deepep = get_moe_a2a_backend().is_deepep()
+        self.fused_experts_impl_w4a8_marlin = fused_experts_impl_w4a8_marlin
 
     def create_weights(
         self,
@@ -388,7 +389,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        output = fused_experts_impl_w4a8_marlin(
+        output = self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -435,7 +436,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -555,7 +556,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         routed_scaling_factor = (
             1.0 if routed_scaling_factor is None else routed_scaling_factor
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             w1,
             w2,
@@ -689,6 +690,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer: torch.nn.Module,
         dispatch_output,
     ):
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         x = dispatch_output.hidden_states
