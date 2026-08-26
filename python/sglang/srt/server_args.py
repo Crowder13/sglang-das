@@ -111,6 +111,21 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
+def _pre_warm_nccl_help() -> str:
+    if is_hcu():
+        return (
+            "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT "
+            "cold-start latency. Default: enabled for HCU/HIP/RCCL, disabled "
+            "for CUDA/NCCL."
+        )
+    return (
+        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT "
+        "cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled "
+        "for NVIDIA/CUDA (NCCL)."
+    )
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
@@ -2110,7 +2125,7 @@ class ServerArgs:
     ] = False
     pre_warm_nccl: A[
         bool,
-        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HCU/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+        _pre_warm_nccl_help(),
         NS("exec.comm"),
     ] = False
     enable_quant_communications: A[
