@@ -146,10 +146,14 @@ class MLPSyncBatchInfo:
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
-        # Inactive max_world_size slots must decode as IDLE.
-        global_info_tensor = fallback_tensor.expand(
-            self.dp_size, self.tp_size * self.cp_size, info_width
-        ).contiguous()
+        # Inactive max_world_size slots must decode as IDLE. repeat() (not
+        # expand().contiguous()) so the buffer never aliases fallback_tensor:
+        # at world size 1 the expanded view is already contiguous, contiguous()
+        # is a no-op, and the masked fallback writes below would then read and
+        # write the same storage.
+        global_info_tensor = fallback_tensor.repeat(
+            self.dp_size, self.tp_size * self.cp_size, 1
+        )
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
@@ -273,7 +277,7 @@ def prepare_mlp_sync_batch_raw(
     # With a single DP replica and no residual attention-TP/MLP-TP gather,
     # every CP rank receives the same work through the CP control broadcast.
     # The scheduler metadata all-gather is therefore redundant and can hang
-    # on DCU CPU process groups during the idle loop.  Reuse the established
+    # on HCU CPU process groups during the idle loop.  Reuse the established
     # skip path, which records each rank's local token count as required by CP.
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or (
         dp_size == 1 and attn_tp_size == 1 and not require_mlp_tp_gather

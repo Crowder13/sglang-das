@@ -15,7 +15,11 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -149,9 +153,12 @@ if _is_hip:
         )
         from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
-        print(
-            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-        )
+        if _is_hcu:
+            print("aiter kernel library is unavailable on this HCU device.")
+        else:
+            print(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            )
 elif _is_hcu:
     from sglang.srt.layers.attention.flashattention_interface import (
         flash_attn_varlen_func,
@@ -317,7 +324,7 @@ class DeepseekSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
@@ -341,10 +348,9 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.dsa_prefill_impl: _DSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
-        )
-        self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.supports_mha_one_shot: bool = True
+        self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
+        self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -397,13 +403,11 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
-            model_runner.server_args, seed_dsa_topk_from_draft_extend
-        )
+        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -3335,7 +3339,8 @@ class DeepseekSparseAttnBackend(
 
             # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
+                self.supports_mha_one_shot
+                and (
                     device_sm == 90
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95
