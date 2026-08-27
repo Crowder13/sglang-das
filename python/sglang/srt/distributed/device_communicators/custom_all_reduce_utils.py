@@ -22,11 +22,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
-from sglang.srt.cuda_vmm_utils import _gpu_fabric_clique
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_musa
+from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,10 @@ if _is_hip:
             amdsmi_topo_get_link_type,
         )
     except ImportError as e:
-        logger.warning("Failed to import ROCm SMI package with %r", e)
+        if _is_hcu:
+            logger.warning("Failed to import ROCm SMI package on HCU")
+        else:
+            logger.warning("Failed to import ROCm SMI package with %r", e)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -372,8 +375,10 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                     except AmdSmiException as error:
                         if _is_hcu:
                             logger.error(
-                                "HCU 1 hop HSL detection failed.",
-                                exc_info=error,
+                                "HCU 1 hop HSL topology query failed for "
+                                "device pair (%s, %s).",
+                                physical_device_ids[i],
+                                physical_device_ids[j],
                             )
                         else:
                             logger.error(
