@@ -2329,7 +2329,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
+                        if kv_chunk.kv_sent:
+                            ret = 0
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
@@ -2395,43 +2397,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                        if kv_chunk.kv_sent:
-                            ret = 0
-                        elif len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
-                            ret = 0
-                        else:
-                            if (
-                                self.is_mla_backend
-                                or self.is_hybrid_mla_backend
-                                or self.attn_tp_size
-                                == target_rank_registration_info.dst_attn_tp_size
-                            ):
-                                ret = self.send_kvcache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                )
-                            elif (
-                                self.enable_staging
-                                and staging_strategy is not None
-                                and target_rank_registration_info.staging is not None
-                            ):
-                                ret, deferred = self._do_staging_transfer(
-                                    staging_strategy,
-                                    kv_chunk,
-                                    req,
-                                    target_rank_registration_info,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                    queue,
-                                    prefill_unique_rank,
-                                )
-                                if deferred:
-                                    staging_deferred = True
-                                    # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                    break
                             else:
                                 ret = self.send_kvcache_slice(
                                     req.mooncake_session_id,
