@@ -10,8 +10,6 @@ on:
 
 permissions:
   contents: read
-  # 推送完成后触发 nightly-test-image-hcu.yml 需要 workflow 写权限
-  workflows: write
 
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
@@ -26,6 +24,8 @@ jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
     runs-on: nmz4
+    outputs:
+      docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,10 +49,12 @@ jobs:
           echo "AICC_VERSION=${LATEST_AICC#dtk_llvm_}" >> "$GITHUB_ENV"
 
       - name: 生成镜像 tag
+        id: gen-tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=sglang:${SGLANG_VERSION}-latest" >> "$GITHUB_ENV"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 构建镜像
         run: |
@@ -86,22 +88,15 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      # 镜像推送成功后串行触发 nightly 测试, 把本次构建的具体镜像名传给测试 workflow
-      - name: 触发镜像测试
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'nightly-test-image-hcu.yml',
-              ref: 'main',
-              inputs: {
-                docker_image: `${process.env.HARBOR_SITE}/${process.env.HARBOR_NAMESPACE}/${process.env.IMAGE_TAG}`,
-              },
-            })
-
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
+  # 镜像推送成功后串行运行 nightly 测试, 把本次构建的具体镜像名传给测试 workflow
+  test-image:
+    needs: build
+    uses: ./.github/workflows/nightly-test-image-hcu.yml
+    with:
+      docker_image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit

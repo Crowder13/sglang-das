@@ -3,10 +3,16 @@
 
 name: test-docker-image-daily
 
-# 由 release-docker-hcu.yml 推送镜像成功后通过 workflow_dispatch 串行触发,
-# 不再使用 schedule, 避免测试到旧镜像
+# 由 release-docker-hcu.yml 推送镜像成功后通过 workflow_call 串行触发,
+# 也可手动 workflow_dispatch 指定镜像重测, 不再使用 schedule, 避免测试到旧镜像
 on:
   workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
+        required: true
+        type: string
+  workflow_call:
     inputs:
       docker_image:
         description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
