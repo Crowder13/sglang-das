@@ -38,6 +38,12 @@ RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp
     bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
     rm -f /tmp/hcu_llvm_installer.sh
 
+# 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
+RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
+    chmod +x /tmp/dtk_blas_cut_installer.sh && \
+    bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
+    rm -f /tmp/dtk_blas_cut_installer.sh
+
 RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
@@ -81,3 +87,7 @@ RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
+
+# 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
+ARG IMAGE_TAG
+ENV IMAGE_TAG=${IMAGE_TAG}

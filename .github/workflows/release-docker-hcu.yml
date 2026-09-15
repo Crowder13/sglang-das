@@ -48,7 +48,7 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
-            --build-arg "IMAGE_TAG=${IMAGE_TAG}" \
+            --build-arg "IMAGE_TAG=${FULL_TAG}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
             --build-arg "SGLANG_VERSION=${SGLANG_VERSION}" \
