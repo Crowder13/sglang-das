@@ -62,7 +62,7 @@ jobs:
             -f docker/hcu.Dockerfile \
             .
 
-      - name: 登录 Harbor
+      - name: push 前登录 Harbor(构建不需要登录)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.HARBOR_SITE }}
