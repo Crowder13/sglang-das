@@ -140,6 +140,10 @@ jobs:
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/rustup-init.sh
           export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
           export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+          # home 卷跨 run 保留时会残留旧 rustup: 日志里出现 "cannot install while Rust is
+          # installed" 且工具链 "unchanged",老 cargo(如 1.75)编不过新代码的 edition2024。
+          # 删干净后全新安装, 保证每次拿到最新 stable 工具链
+          rm -rf "${HOME}/.rustup" "${HOME}/.cargo"
           bash rustup-init.sh -y
           rm -rf ${HOME}/.cargo/config
           mkdir -p ${HOME}/.cargo
