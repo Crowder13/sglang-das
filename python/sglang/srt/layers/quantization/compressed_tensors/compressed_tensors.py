@@ -75,11 +75,12 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -923,16 +924,44 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            # HCU packed INT4 + dynamic per-token INT8: this is W4A8 in
+            # compressed-tensors metadata, but the checkpoint is still
+            # pack-quantized (not ngram unpacked int8). NVIDIA CUTLASS
+            # W4AFP8 is unavailable; reuse Triton GPTQ MoE with
+            # use_int4_w4a8 so activations are quantized per token.
+            if (
+                _is_hcu
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+                and input_quant is not None
+                and input_quant.type == QuantizationType.INT
+            ):
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
+                )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            else:
-                raise NotImplementedError(
-                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            if (
+                _is_hcu
+                and self.quant_format == CompressionFormat.pack_quantized.value
+            ):
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
                 )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
+            raise NotImplementedError(
+                "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -1102,12 +1131,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                except ValueError:
+                    # Mixed checkpoints (e.g. Qwen3.8-Flash-Next Channelwise
+                    # FP8) only list MoE experts in config_groups.targets;
+                    # unmatched linears stay BF16 via UnquantizedLinearMethod.
+                    return None
 
             return self.target_scheme_map[matched_target]
 
@@ -1297,6 +1332,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.restore_weights_before_loading(layer)
 
     def create_weights(
         self,

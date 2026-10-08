@@ -50,8 +50,10 @@ sources = [
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
+    "csrc/elementwise/kpool_write_plan.cu",
     # HCU-only kernel, no upstream counterpart.
     "csrc/elementwise/l2norm_kernel.cu",
     # Native HIP implementation of the same three ops exposed by topk.cu.

@@ -50,8 +50,10 @@ sources = [
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
+    "csrc/elementwise/kpool_write_plan.cu",
     "csrc/elementwise/l2norm_kernel.cu",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
@@ -63,7 +65,7 @@ sources = [
     "csrc/attention/merge_attn_states.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
-    #"csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
+    # "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
 cxx_flags = ["-O3", "-w"]
