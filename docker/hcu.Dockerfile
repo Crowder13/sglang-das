@@ -39,7 +39,7 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     'ver=$(pip index versions "$pkg" 2>/dev/null | grep -oP "${prefix}[^ ()]*${tag}[^ ()]*" | head -1)' \
     '[ -z "$ver" ] && echo "Error: No version for $pkg matching $tag" && exit 1' \
     'echo "Installing $pkg==$ver"' \
-    'pip install --no-cache-dir --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com "$pkg==$ver"' \
+    'pip install --no-cache-dir --extra-index-url https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com "$pkg==$ver"' \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
 
 # AICC 编译器安装 (安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录);
@@ -65,9 +65,9 @@ RUN mkdir -p /opt/hcusmi && \
 
 # ---layer---
 RUN pip install --no-cache-dir ninja wheel setuptools \
-    && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir cupy \
-    && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    && pip install --no-cache-dir apache-tvm-ffi==0.1.11 -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir vllm==0.25.1 \
     && pip install --no-cache-dir hcusmi==1.0.0+a788f784 \
     && pip cache purge
@@ -97,7 +97,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
 ARG SGLANG_VERSION
 RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
     && pip install --no-cache-dir "fastapi==0.115.12" "starlette==0.46.2" "prometheus-fastapi-instrumentator==7.1.0" \
-    && pip install --no-cache-dir nvidia-cutlass-dsl==4.4.2 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+    && pip install --no-cache-dir nvidia-cutlass-dsl==4.4.2 -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com \
     && pip install --no-cache-dir sglang[diffusion]==${SGLANG_VERSION} sglang-router \
     && pip install --no-cache-dir numpy==2.0.2 \
     && pip install --no-cache-dir setuptools==79.0.1 \
