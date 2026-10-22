@@ -20,7 +20,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -96,12 +99,14 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 
 if TYPE_CHECKING:
@@ -280,11 +285,17 @@ class _SelectorDraftSampler:
             min=1e-5,
             out=self.temperatures[:bs],
         )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+        if _is_hcu:
+            # The graph consumes this stable buffer. Write the comparison into
+            # it directly, avoiding a temporary mask and a second kernel copy
+            # on every DFLASH decode step.
+            torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
+        else:
+            self.greedy_mask[:bs].copy_(
+                resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+                )
             )
-        )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -292,16 +303,29 @@ class _SelectorDraftSampler:
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
-        tokens, q_rows = self.selector.sample_path(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            uniforms=self.uniforms[:bs].uniform_(),
-            temperatures=self.temperatures[:bs],
-            greedy_mask=self.greedy_mask[:bs],
-        )
-        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        if _is_hcu:
+            from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+
+            selector_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                tokens_out=self.out[: bs * (self.block_size - 1)].view(bs, -1),
+                q_out=self.q_out[:bs],
+            )
+        else:
+            tokens, q_rows = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
+            self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+            self.q_out[:bs].copy_(q_rows)
         self.candidate_out[:bs].copy_(candidate_ids)
-        self.q_out[:bs].copy_(q_rows)
 
 
 class _DominoDraftSampler:
@@ -361,7 +385,7 @@ class _DominoDraftSampler:
             lm_head_org_vocab_start=self.lm_head_org_vocab_start,
             lm_head_num_org=self.lm_head_num_org,
             lm_head_num_org_padded=self.lm_head_num_org_padded,
-            prefer_tp_candidate_pool=bs > 1,
+            in_cuda_graph=True,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
@@ -405,6 +429,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
+        check_simulate_acc_token_mode()
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
@@ -592,6 +617,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._target_logits_processor = self._defer_target_verify_gather()
+
+    def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            return None
+        processors[0].defer_verify_gather = True
+        return processors[0]
+
+    def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
+        if (
+            self._selector_sample is not None
+            or batch.has_grammar
+            or batch.return_logprob
+        ):
+            return False
+        if sampling_info is None:
+            return True
+        penalizer = sampling_info.penalizer_orchestrator
+        return (
+            sampling_info.is_all_greedy
+            and not sampling_info.has_custom_logit_processor
+            and getattr(sampling_info, "acc_linear_penalties", None) is None
+            and (penalizer is None or not penalizer.is_required)
+            and getattr(sampling_info, "grammar_mask", None) is None
+            and getattr(sampling_info, "logit_bias", None) is None
+            and sampling_info.sampling_mask_batch_indices is None
+        )
 
     @property
     def draft_worker(self):
@@ -2142,9 +2199,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        target_predict: Optional[torch.Tensor] = None,
     ):
         new_seq_lens = None
-        target_predict = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2158,7 +2215,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        elif (
+        elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
@@ -2172,9 +2229,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
@@ -2214,7 +2271,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        if SIMULATE_ACC_LEN > 0:
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                next_token_logits=next_token_logits,
+            )
+            # The Triton path may have written new_seq_lens from the real
+            # accept_len; recompute it from the forced commit_lens.
+            new_seq_lens = None
+
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2318,10 +2392,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if _is_hcu:
+                # Constructing tensors directly on the GPU issues blocking H2D
+                # copies after target prefill. Stage both host length lists in
+                # one pinned allocation so the host can enqueue draft KV work
+                # without waiting for target kernels to complete.
+                lengths_cpu = torch.tensor(
+                    [batch.extend_lens, batch.prefix_lens],
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                ctx_lens, draft_seq_lens = lengths_cpu.to(
+                    device=device, non_blocking=True
+                ).unbind(0)
+            else:
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
@@ -2580,7 +2671,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=(
-                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
+                torch.full((), bs * block_size, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()
                 else None
             ),
@@ -2655,6 +2746,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head_num_org_padded=(
                     int(shard.num_org_elements_padded) if shard is not None else None
                 ),
+                in_cuda_graph=False,
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
@@ -2805,6 +2897,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        target_predict = None
+        target_lp = self._target_logits_processor
+        if target_lp is not None and target_lp.is_deferred_shard(
+            logits_output.next_token_logits
+        ):
+            if self._can_skip_verify_logits(batch, sampling_info):
+                target_predict = target_lp.deferred_argmax(
+                    logits_output.next_token_logits
+                )
+                logits_output.next_token_logits = None
+            else:
+                logits_output.next_token_logits = target_lp.finish_deferred_gather(
+                    logits_output.next_token_logits
+                )
 
         grammar_mask = None
         if batch.has_grammar:
@@ -2816,7 +2922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and target_predict is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -2834,7 +2940,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus,
             out_tokens,
             new_seq_lens,
-            target_predict,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2842,35 +2947,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            target_predict=target_predict,
         )
-
-        if SIMULATE_ACC_LEN > 0:
-            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
-                raise ValueError(
-                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
-                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
-                    "'real-draft-token'."
-                )
-
-            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
-                # The sampling-verify branch does not materialize the target argmax.
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
-            apply_dflash_simulated_acceptance(
-                candidates=candidates,
-                target_predict=target_predict,
-                accept_len=accept_len,
-                commit_lens=commit_lens,
-                bonus=bonus,
-                out_tokens=out_tokens,
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,

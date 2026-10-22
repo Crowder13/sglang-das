@@ -33,7 +33,9 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
@@ -44,9 +46,11 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_hcu,
 )
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and get_platform().is_sm90
 _is_sm100_supported = _is_cuda and get_platform().is_sm100
@@ -172,7 +176,7 @@ def aiter_ar_fusion_applies(input_tensor: torch.Tensor, forward_batch: ForwardBa
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
-        _use_aiter
+        (_use_aiter or _is_hcu)
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
@@ -213,6 +217,10 @@ def _update_and_read_residual_aiter_fp8_group(
     unquantized bf16 output rides along as a third element, so the DSA indexer
     can skip dequantizing. post_residual_addition is not applied on this path."""
     needs_bf16 = get_attn_tp_context().is_dsa
+    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+        hidden_states.shape[0],
+        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+    )
     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
         hidden_states,
         norm.weight,
@@ -224,9 +232,11 @@ def _update_and_read_residual_aiter_fp8_group(
         dtype_quant=torch.float8_e4m3fn,
         res1=residual,
         output_unquantized_inp1=needs_bf16,
-        transpose_scale=False,
+        transpose_scale=emit_transposed_scale,
     )
-    if _use_aiter_bpreshuffle_gfx95:
+    if emit_transposed_scale:
+        output = view_aiter_fused_rms_transposed_fp8_scale_tuple(output)
+    elif _use_aiter_bpreshuffle_gfx95:
         output = materialize_bpreshuffle_fp8_scale_tuple(output)
     if needs_bf16:
         output = (output[0], output[1], unquantized)
@@ -248,11 +258,23 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _update_and_read_residual_lightop_fp8_per_token(
+    norm, hidden_states, residual, post_residual_addition
+):
+    if residual is None:
+        return norm.forward_with_lightop_fp8_quant(hidden_states), hidden_states
+    return norm.forward_with_lightop_fp8_quant(
+        hidden_states, residual, post_residual_addition
+    )
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if _is_hcu and quant_format == "lightop_fp8_per_token":
+        return _update_and_read_residual_lightop_fp8_per_token
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
@@ -265,9 +287,14 @@ def _norm_quant_kernel(quant_format: str):
 class PlainAdd:
     """A plain residual: the output is added into it."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = True
     applied_at_exit = False
     outlives_layer = True
+    writes_stream = False
+    quantized_sum = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
@@ -286,9 +313,14 @@ class ReplaceAtExit:
     previous residual is dropped. The stream is complete: the producer has its
     boundary complete each part's sum first (StageBoundary.sum_part)."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = True
+    writes_stream = True
+    quantized_sum = False
 
     def update(self, hidden_states, residual):
         return hidden_states
@@ -312,10 +344,19 @@ class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
-    the norm."""
+    the norm.
+
+    ``post_residual_addition`` is added after a plain add and before the norm.
+    It is not applied by the aiter mxfp4 and fp8-group kernels, after an
+    update other than a plain add, or by ``read``, which has no add."""
+
+    bind = None
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
 
     def init_residual(self, hidden_states):
@@ -347,10 +388,17 @@ class NormQuantReadout:
 @dataclass(frozen=True)
 class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
-    runs in the same kernel. An empty batch skips the norm."""
+    runs in the same kernel. An empty batch skips the norm. It rejects a
+    ``quant_format`` and a ``post_residual_addition``, except that the latter
+    is not applied after an update other than a plain add."""
+
+    bind = None
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states
@@ -393,7 +441,11 @@ class UnfusedNormReadout(NormReadout):
     two steps: the update rounds to the activation dtype before the norm, as
     in models that add their residual themselves. No fused kernel takes it."""
 
+    bind = None
+
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
 
     def update_and_read(
         self,

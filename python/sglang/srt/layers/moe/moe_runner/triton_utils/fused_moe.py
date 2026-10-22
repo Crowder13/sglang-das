@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_xpu,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -76,6 +78,9 @@ if _is_cuda:
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -93,8 +98,6 @@ elif _is_hip:
                 MoeSolutionType,
                 aiter_moe,
                 get_aiter_moe_config,
-                aiter_moe_shfl_weight,
-                aiter_moe_shfl_scale
             )
         except ImportError:
             raise ImportError(
@@ -138,6 +141,7 @@ class _CodePathChecker:
 
 deepseek_v4_moe_code_path_checker = _CodePathChecker()
 
+
 def _validate_fused_swiglu_interleaved(
     *,
     activation: str,
@@ -164,7 +168,39 @@ def _validate_fused_swiglu_interleaved(
         )
 
 
+def _activation_row_filter(
+    *,
+    down_moe_use_tma: bool,
+    filter_expert: bool,
+    topk_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size_m: int,
+) -> Dict[str, Any]:
+    """Row filter for the CUDA JIT gated activations; empty computes every row."""
+    # HIP/XPU compute every row: the down kernel zeros filtered rows without
+    # reading their input.
+    if not _is_cuda or not (down_moe_use_tma or filter_expert):
+        return {}
+    if not down_moe_use_tma:
+        return dict(expert_ids=topk_ids.view(-1), expert_step=1)
+    # The TMA down buffer is sorted, block-padded and sized for the worst case;
+    # compute only the rows the down GEMM reads.
+    return dict(
+        expert_ids=expert_ids,
+        expert_step=block_size_m,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=topk_ids.numel(),
+    )
+
+
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    # Inductor autotune of this epilogue hangs on HCU/HIP: benchmark
+    # synchronize never returns, and the stalled rank tears down NCCL.
+    if _is_hcu:
+        return False
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
@@ -458,7 +494,10 @@ def fused_experts(
         )
         else 1
     )
-    if isinstance(moe_runner_config.activation, str) and moe_runner_config.activation.lower() == "situ":
+    if (
+        isinstance(moe_runner_config.activation, str)
+        and moe_runner_config.activation.lower() == "situ"
+    ):
         act_id = 2
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
@@ -688,7 +727,11 @@ def fused_experts_impl_aiter(
             activation = "situ"
         else:
             activation = "gelu"
-    is_channelwise_w4a8_w8a8 = (quant_type == MoeQuantType.FP8_W8A8 or quant_type == MoeQuantType.W4A8) and block_shape is None
+    is_channelwise_w4a8_w8a8 = (
+        quant_type == MoeQuantType.FP8_W8A8
+        or quant_type == MoeQuantType.W8A8
+        or quant_type == MoeQuantType.W4A8
+    ) and block_shape is None
     if not is_channelwise_w4a8_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
             "AITER MoE requires block_shape with two dimensions for this "
@@ -719,9 +762,9 @@ def fused_experts_impl_aiter(
     force_w4a16_moec = _should_force_aiter_w4a16_moec(quant_type)
     status, moe_cfg = _get_aiter_moe_config_w4a16(config_kwargs, force_w4a16_moec)
     if status:
-        assert (
-            moe_cfg.solution_type is not None
-        ), "status=True but solution_type is None"
+        assert moe_cfg.solution_type is not None, (
+            "status=True but solution_type is None"
+        )
         assert moe_cfg.config is not None, "status=True but config is None"
         assert moe_cfg.solution_type in (
             MoeSolutionType.MOE_C,
@@ -732,6 +775,7 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
+            MoeQuantType.W8A8,
             MoeQuantType.WFP4A16,
             MoeQuantType.W4A8,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
@@ -741,9 +785,9 @@ def fused_experts_impl_aiter(
         #     f"config keys={list(moe_cfg.config.keys())}"
         # )
     else:
-        assert (
-            moe_cfg.solution_type is None
-        ), "status=False but solution_type is not None"
+        assert moe_cfg.solution_type is None, (
+            "status=False but solution_type is not None"
+        )
         assert moe_cfg.config is None, "status=False but config is not None"
         print(
             f"[get_config_aiter_moe] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_size}, dtype={hidden_states.dtype}, quant_type={quant_type} "
@@ -751,7 +795,7 @@ def fused_experts_impl_aiter(
         )
 
     if (
-        (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
+        (quant_type == MoeQuantType.W4A16 or quant_type == MoeQuantType.WFP4A16)
         and status
         and _aiter_moec_solution_type(moe_cfg)
         and getattr(moe_cfg, "need_shuffle_scale", False)
@@ -763,7 +807,7 @@ def fused_experts_impl_aiter(
     #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
     # if status and getattr(moe_cfg, "need_shuffle_scale", False):
     #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
-    
+
     return aiter_moe(
         hidden_states,
         w1,
@@ -820,7 +864,9 @@ def _prepare_fused_moe_run(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=(use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8),
+        use_int4_w4a16=(
+            use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8
+        ),
         dtype=hidden_states.dtype,
     )
 
@@ -996,7 +1042,14 @@ def _fused_moe_kernel_sequence(
             ),
             has_bias=b1 is not None,
             is_quantized=any(
-                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16, use_mxfp4_w4a16, use_mxfp4_w4a8)
+                (
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    use_mxfp4_w4a16,
+                    use_mxfp4_w4a8,
+                )
             ),
             apply_router_weight_on_input=apply_router_weight_on_input,
             has_hooks=hooks is not None,
@@ -1065,6 +1118,16 @@ def _fused_moe_kernel_sequence(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+
+    row_filter = _activation_row_filter(
+        down_moe_use_tma=down_moe_use_tma,
+        filter_expert=filter_expert,
+        topk_ids=topk_ids,
+        expert_ids=expert_ids,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        block_size_m=config["BLOCK_SIZE_M"],
+    )
 
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
@@ -1145,17 +1208,9 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit=swiglu_limit_for_triton,
                 )
         elif _is_cuda or _is_hip or _is_xpu:
-            if filter_expert and _is_cuda:
-                # HIP/XPU fall through to the unfiltered path: the down kernel
-                # zeros filtered rows without reading their input.
-                silu_and_mul(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
-                )
-            else:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            silu_and_mul(
+                intermediate_cache1.view(-1, N), intermediate_cache2, **row_filter
+            )
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -1186,15 +1241,9 @@ def _fused_moe_kernel_sequence(
             activation_fn = (
                 gelu_tanh_and_mul if activation == "gelu_tanh" else gelu_and_mul
             )
-            if filter_expert and _is_cuda:
-                activation_fn(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
-                )
-            else:
-                activation_fn(intermediate_cache1.view(-1, N), intermediate_cache2)
+            activation_fn(
+                intermediate_cache1.view(-1, N), intermediate_cache2, **row_filter
+            )
         else:
             if _has_vllm_ops:
                 getattr(vllm_ops, f"{activation}_and_mul")(
@@ -1240,6 +1289,24 @@ def _fused_moe_kernel_sequence(
     if use_fused_moe_sum_all_reduce:
         out_slice = out_hidden_states
         out_slice.zero_()
+
+    if (
+        _is_cuda
+        and down_moe_use_tma
+        and use_fp8_w8a8
+        and block_shape is not None
+        and a2_scale is None
+        and intermediate_cache2.shape[-1] != block_shape[1]
+    ):
+        # Same quant the down call would run, restricted to the rows the down
+        # GEMM reads; a single whole-row group keeps that call's per-token kernel.
+        intermediate_cache2, a2_scale = per_token_group_quant(
+            intermediate_cache2,
+            group_size=block_shape[1],
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            num_valid_tokens=topk_ids.numel(),
+        )
 
     invoke_fused_moe_kernel(
         intermediate_cache2,
@@ -1417,16 +1484,27 @@ def fused_experts_impl(
 ):
     if (
         _use_aiter_moe
+        # HCU INT8 fallback requires raw weights and Triton's swiglu_limit.
+        and not (_is_hcu and use_int8_w8a8)
         and not is_triton_forced_for_dspark_aiter_fallback()
         # AITER expects a complete expert weight set. EP-local shards keep
         # global expert ids and require Triton's filter_expert path.
         and not filter_expert
-        and (use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8 or use_int8_w8a8 or use_fp8_w8a8)
+        and (
+            use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
+            or use_int8_w8a8
+            or use_fp8_w8a8
+        )
         and hidden_states.dtype == torch.bfloat16
     ):
         if use_mxfp4_w4a8:
             if not hasattr(MoeQuantType, "WFP4A8"):
-                raise RuntimeError("The installed AITER package does not support MoeQuantType.WFP4A8.")
+                raise RuntimeError(
+                    "The installed AITER package does not support MoeQuantType.WFP4A8."
+                )
             quant_type = MoeQuantType.WFP4A8
         elif use_mxfp4_w4a16:
             quant_type = MoeQuantType.WFP4A16
@@ -1443,6 +1521,8 @@ def fused_experts_impl(
                 quant_type = MoeQuantType.W4A16
         elif use_int4_w4a8:
             quant_type = MoeQuantType.W4A8
+        elif use_int8_w8a8:
+            quant_type = MoeQuantType.W8A8
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(
@@ -1463,7 +1543,8 @@ def fused_experts_impl(
             routed_scaling_factor,
             quant_type,
             gemm1_alpha,
-            gemm1_limit
+            # Preserve GPT-OSS/other explicit clamp limits when no DS limit is set.
+            gemm1_limit=swiglu_limit if swiglu_limit is not None else gemm1_limit,
         )
 
     if isinstance(activation, int):
@@ -1473,12 +1554,7 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if (
-        use_int4_w4a16
-        or use_int4_w4a8
-        or use_mxfp4_w4a16
-        or use_mxfp4_w4a8
-    ):
+    if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert hidden_states.shape[1] == w1.shape[2] - padded_size, (

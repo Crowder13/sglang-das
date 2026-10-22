@@ -311,8 +311,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
-        # Disable inplace MoE when fused gate will need hidden_states after experts
-        _needs_hidden_after_experts = (
+        _gate_uses_amx = _is_cpu and _is_cpu_amx_available
+        if _gate_uses_amx:
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("shared_expert_gate", prefix),
+            )
+        else:
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+        # fused_gate_sigmoid_mul_add (see forward) computes the shared-expert
+        # gate outside the MoE call and reads hidden_states after self.experts
+        # has already run, so the MoE must not write its output into the
+        # hidden_states buffer. Intel-AMX CPU and NPU instead apply the gate
+        # inside _forward_shared_experts, before the experts.
+        # use_intel_amx_backend() reads a layer attr that is set only in
+        # process_weights_after_loading, too late for this decision.
+        self.use_fused_gate = (
+            self.shared_expert_gate is not None and not _gate_uses_amx and not is_npu()
+        )
+        _needs_hidden_after_experts = self.use_fused_gate and (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
@@ -372,27 +393,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or get_moe_a2a_backend().is_ascend_fuseep()
                     )
                     else {}
                 ),
             )
         else:
             self.shared_expert = None
-        if _is_cpu and _is_cpu_amx_available:
-            self.shared_expert_gate = ReplicatedLinear(
-                config.hidden_size,
-                1,
-                bias=False,
-                quant_config=None,
-                prefix=add_prefix("shared_expert_gate", prefix),
-            )
-        else:
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
@@ -827,14 +840,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
-        use_fused_gate = (
-            self.shared_expert_gate is not None
-            and not use_intel_amx_backend(self.shared_expert_gate)
-            and not is_npu()
-        )
+        # Decided once in __init__ (also drives the experts' inplace=False there)
+        use_fused_gate = self.use_fused_gate
 
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
@@ -1026,9 +1037,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Qwen2MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_next_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
@@ -1053,13 +1063,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages a Qwen2-MoE layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        # Qwen2MoE all layers are sparse and have no nextn now
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -1138,6 +1158,7 @@ class Qwen2MoeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib.util
 import logging
 import os
@@ -7,7 +8,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from contextvars import ContextVar
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 from packaging import version as pkg_version
@@ -27,9 +28,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_spec,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_hcu
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 from sglang.srt.utils.common import log_info_on_rank0
 
@@ -53,9 +55,7 @@ _dspark_w4a8_tpmoe_backend_override = ContextVar(
 )
 
 
-def normalize_w4a8_tpmoe_backend(
-    requested_backend: str, *, env_name: str
-) -> str:
+def normalize_w4a8_tpmoe_backend(requested_backend: str, *, env_name: str) -> str:
     backend = requested_backend.strip().lower()
     if backend not in W4A8_TPMOE_BACKENDS:
         supported = ", ".join(repr(value) for value in sorted(W4A8_TPMOE_BACKENDS))
@@ -139,6 +139,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_mori_epv2(self):
+        return self.is_mori() and envs.SGLANG_MORI_EP_V2.get()
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
@@ -507,6 +510,27 @@ def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     )
 
 
+# Only flashinfer_megamoe is special-cased: its global-expert-id dispatch
+# assumes quantized layers, which draft (MTP/NextN) layers typically are not.
+# DeepGEMM megamoe (a2a "megamoe") falls back per-layer when its weights
+# are not prepared, so drafts can inherit it. A quantized draft that wants
+# flashinfer_megamoe must set the --speculative-moe-* flags explicitly.
+def _default_speculative_a2a_backend(
+    target_a2a_backend: MoeA2ABackend,
+) -> MoeA2ABackend:
+    if target_a2a_backend.is_flashinfer_megamoe():
+        return MoeA2ABackend.NONE
+    return target_a2a_backend
+
+
+def _default_speculative_moe_runner_backend(
+    target_runner_backend: MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    if target_runner_backend.is_flashinfer_megamoe():
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
+    return target_runner_backend
+
+
 def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
@@ -524,12 +548,12 @@ def initialize_moe_config():
     moe.speculative_runner_backend = (
         resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
         if spec.speculative_moe_runner_backend is not None
-        else moe.runner_backend
+        else _default_speculative_moe_runner_backend(moe.runner_backend)
     )
     moe.speculative_a2a_backend = (
         MoeA2ABackend(spec.speculative_moe_a2a_backend)
         if spec.speculative_moe_a2a_backend is not None
-        else moe.a2a_backend
+        else _default_speculative_a2a_backend(moe.a2a_backend)
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
@@ -604,7 +628,6 @@ def will_use_aiter_moe() -> bool:
         or envs.SGLANG_INT4_WEIGHT.get()
         or get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
     ) and get_moe_a2a_backend().supports_aiter()
-
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
@@ -802,13 +825,13 @@ def get_tbo_token_distribution_threshold() -> float:
     return moe.tbo_token_distribution_threshold
 
 
-
 def should_use_flashinfer_trtllm_moe():
     return get_moe_runner_backend().is_flashinfer_trtllm() and (
         not importlib.util.find_spec("flashinfer")
         or pkg_version.parse(__import__("flashinfer").__version__)
         >= pkg_version.parse("0.2.9rc1")
     )
+
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
@@ -832,6 +855,25 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_flags().moe.quantization == "modelopt_fp4"
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    )
+
+
+def hcu_moe_tp_matches_attention_tp() -> bool:
+    """Standard TP MoE can keep attention-local rows when group membership agrees.
+
+    EP or CP layouts are excluded: matching sizes alone do not prove membership.
+    The output still owes a MoE-TP sum; it is not an A2A-complete output.
+    """
+    if not _is_hcu or not is_dp_attention_enabled():
+        return False
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and parallel.attn_cp_size == 1
+        and parallel.moe_ep_size == 1
+        and parallel.attn_dp_size > 1
+        and parallel.moe_dp_size == parallel.attn_dp_size
+        and parallel.moe_tp_size == parallel.attn_tp_size
     )
 
 
@@ -1213,3 +1255,45 @@ def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
     except Exception:
         pass
     return 1, "ifb"
+
+
+def get_deepgemm_marlin_weight_pack_fn(
+    weight_dtype: str,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return the DeepGEMM MoE weight packer for the P/D topology.
+
+    Decode uses the masked layout; prefill and IFB use the contiguous layout.
+    IFB shares one packed buffer between both GEMMs: INT8 uses
+    ``shuffle_unique=1``, and FP8 packers produce the same layout per arch.
+    """
+    if not _is_hcu:
+        raise RuntimeError("DeepGEMM marlin weight packing requires the HCU runtime")
+    shuffle_unique, mode = _get_deepgemm_shuffle_unique()
+    use_masked = mode == "decode"
+
+    if weight_dtype == "fp8":
+        from deepgemm import marlin_fp8_contiguous_weight, marlin_fp8_masked_weight
+
+        return marlin_fp8_masked_weight if use_masked else marlin_fp8_contiguous_weight
+
+    if weight_dtype == "int8":
+        try:
+            from deepgemm import (
+                marlin_int8_contiguous_weight,
+                marlin_int8_masked_weight,
+            )
+        except ImportError:
+            # Older DeepGEMM builds expose only the marlin_i8_* names.
+            from deepgemm import (
+                marlin_i8_contiguous_weight as marlin_int8_contiguous_weight,
+            )
+            from deepgemm import marlin_i8_masked_weight as marlin_int8_masked_weight
+
+        pack_fn = (
+            marlin_int8_masked_weight if use_masked else marlin_int8_contiguous_weight
+        )
+        return functools.partial(pack_fn, shuffle_unique=shuffle_unique)
+
+    raise ValueError(
+        f"Unsupported DeepGEMM weight dtype {weight_dtype!r}; expected 'fp8' or 'int8'"
+    )

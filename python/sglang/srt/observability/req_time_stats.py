@@ -42,6 +42,7 @@ from sglang.srt.observability.trace_async import (
     is_async_tracing_available,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVTransferMetric
@@ -693,6 +694,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
+    # Why the request remained in the scheduler waiting queue.
+    queue_wait_reason: str = ""
+    queue_wait_reason_start_time: float = 0.0
+    queue_reason_durations: Dict[str, float] = field(default_factory=dict)
+    queue_reason_checks: Dict[str, int] = field(default_factory=dict)
+
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
@@ -728,6 +735,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
     queue_duration_s: float = 0.0
 
+    # Poll-observed waits; staging can include a re-prefetch and overlap prefetch.
+    # None means unmeasured (including stats received from an older scheduler).
+    storage_prefetch_wait_s: Optional[float] = None
+    storage_staging_wait_s: Optional[float] = None
+    _storage_prefetch_wait: Optional[PollTimer] = None
+    _storage_staging_wait: Optional[PollTimer] = None
+
     has_timing_data: bool = False
 
     def __getstate__(self) -> object:
@@ -746,6 +760,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             ),
             # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
             "queue_duration_s": self.queue_duration_s,
+            "storage_prefetch_wait_s": (
+                self.storage_prefetch_wait_s
+                if not (
+                    self._storage_prefetch_wait and self._storage_prefetch_wait.running
+                )
+                else None
+            ),
+            "storage_staging_wait_s": (
+                self.storage_staging_wait_s
+                if not (
+                    self._storage_staging_wait and self._storage_staging_wait.running
+                )
+                else None
+            ),
+            "has_timing_data": True,
+            "wait_queue_entry_time": self.wait_queue_entry_time,
+            "forward_entry_time": self.forward_entry_time,
+            "prefill_finished_time": self.prefill_finished_time,
+            "queue_wait_reason": self.queue_wait_reason,
+            "queue_wait_reason_start_time": self.queue_wait_reason_start_time,
+            "queue_reason_durations": dict(self.queue_reason_durations),
+            "queue_reason_checks": dict(self.queue_reason_checks),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         if not (self.enable_metrics or self.has_timing_data):
@@ -806,6 +842,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 RequestStage.DPC_DISPATCH, ts - self.dpc_dispatch_time
             )
 
+    def set_queue_wait_reason(self, reason: str, ts=None):
+        """Attribute queue residence time to the latest admission blocker."""
+        ts = ts or time.perf_counter()
+        self.queue_reason_checks[reason] = self.queue_reason_checks.get(reason, 0) + 1
+        if reason == self.queue_wait_reason:
+            return
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = reason
+        self.queue_wait_reason_start_time = ts
+
+    def finish_queue_wait_reason(self, ts=None):
+        ts = ts or time.perf_counter()
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = ""
+        self.queue_wait_reason_start_time = 0.0
+
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.spec_draft_start_time = ts
@@ -855,11 +915,34 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
+        self.queue_wait_reason = ""
+        self.queue_wait_reason_start_time = 0.0
+        self.queue_reason_durations.clear()
+        self.queue_reason_checks.clear()
         self.queue_duration_s = 0.0
+        self.storage_prefetch_wait_s = None
+        self.storage_staging_wait_s = None
+        self._storage_prefetch_wait = None
+        self._storage_staging_wait = None
+
+    def observe_storage_prefetch_ready(self, ready: bool):
+        """Accumulate first blocked poll to the subsequent ready poll, per episode."""
+        if self._storage_prefetch_wait is not None:
+            self.storage_prefetch_wait_s += self._storage_prefetch_wait.observe(ready)
+
+    def observe_storage_staging_ready(self, ready: bool):
+        if self._storage_staging_wait is not None:
+            self.storage_staging_wait_s += self._storage_staging_wait.observe(ready)
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
-        if self.wait_queue_entry_time == 0.0:
+        first_entry = self.wait_queue_entry_time == 0.0
+        if first_entry:
+            if self.enable_metrics and self.disagg_mode != DisaggregationMode.DECODE:
+                self.storage_prefetch_wait_s = 0.0
+                self.storage_staging_wait_s = 0.0
+                self._storage_prefetch_wait = PollTimer()
+                self._storage_staging_wait = PollTimer()
             if self.enable_metrics or self.trace_ctx.tracing_enable:
                 if self.disagg_mode == DisaggregationMode.PREFILL:
                     stage = RequestStage.PREFILL_BOOTSTRAP
@@ -877,9 +960,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             self.set_retract_time(ts)
 
         self.wait_queue_entry_time = ts
+        self.set_queue_wait_reason(
+            "awaiting_scheduler_check" if first_entry else "retracted", ts
+        )
 
     def set_forward_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
+        self.finish_queue_wait_reason(ts)
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts
@@ -1291,6 +1378,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
+        if self.storage_prefetch_wait_s is not None and not (
+            self._storage_prefetch_wait and self._storage_prefetch_wait.running
+        ):
+            meta_data["storage_prefetch_wait"] = self.storage_prefetch_wait_s
+        if self.storage_staging_wait_s is not None and not (
+            self._storage_staging_wait and self._storage_staging_wait.running
+        ):
+            meta_data["storage_staging_wait"] = self.storage_staging_wait_s
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time

@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_from_predict_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -210,6 +211,11 @@ def prepare_for_draft_extend(
         return_hidden_states_before_norm=return_hidden_states_before_norm,
         extend_position_info=extend_position_info,
         kv_loc_plan=None if widen else kv_loc_plan,
+        # The draft-extend graph runner owns persistent copies of the DP token
+        # counts and does not consume ForwardBatch.num_token_non_padded.  Avoid
+        # pageable host-to-device copies here; if graph selection fails, the
+        # eager path below materializes the same metadata before using it.
+        defer_device_metadata=True,
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
@@ -226,6 +232,8 @@ def prepare_for_draft_extend(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+    if not can_run_decode_cuda_graph:
+        forward_batch.materialize_deferred_device_metadata(draft_model_runner.device)
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
@@ -711,6 +719,12 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        watermark_state=target_worker.model_runner.watermark_state,
+        watermark_full_mask=(
+            target_worker.model_runner.attn_backend.verify_mask is None
+            or target_worker.model_runner.attn_backend.verify_mask.mode
+            == TreeMaskMode.FULL_MASK
+        ),
     )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
@@ -736,6 +750,11 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens = batch.seq_lens + accept_lens
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.commit_spec_accept_tokens(
+            batch=batch,
+            accept_indices=accept_index,
+        )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -760,15 +779,24 @@ def run_eagle_verify(
     )
 
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
-        accept_tokens = predict[accept_index]
+        if (
+            target_worker.model_runner.watermark_state is not None
+            and batch.sampling_info.has_watermark_candidates
+        ):
+            accept_tokens = predict[accept_index]
+            target_worker.model_runner.watermark_state.append_speculative(
+                batch.req_pool_indices,
+                accept_tokens,
+                accept_lens,
+            )
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
         # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-        fill_bonus_tokens_func(
-            accept_tokens,
+        fill_bonus_tokens_from_predict_func(
+            predict,
+            accept_index,
             accept_lens,
             bonus_tokens,
-            accept_index.shape[1],
             bs,
         )
     elif batch.forward_mode.is_idle():

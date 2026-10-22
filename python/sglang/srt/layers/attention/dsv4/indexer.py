@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -26,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    FP4RowgroupDecodeWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
@@ -53,7 +57,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_schedule,
     get_exec,
     get_parallel,
     get_platform,
@@ -71,7 +78,7 @@ from sglang.srt.utils.common import is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -84,6 +91,126 @@ _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_sup
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 logger = logging.getLogger(__name__)
+
+
+_FRACTION_ENV = "SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION"
+_budget_cache = {}
+
+
+@dataclass(frozen=True)
+class PagedMQAChunkPlan:
+    rows_per_chunk: int
+    budget_bytes: int
+    output_width: int
+    use_prefill: bool
+
+
+def explicit_mqa_fraction():
+    """Absence disables this V4 path; the DSA environment is independent."""
+    raw = os.environ.get(_FRACTION_ENV)
+    if raw is None:
+        return None
+    try:
+        fraction = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_FRACTION_ENV} must be a finite number in (0, 1], got {raw!r}"
+        ) from exc
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError(f"{_FRACTION_ENV} must be in (0, 1], got {raw!r}")
+    return fraction
+
+
+def _budget_bytes(device, fraction, mem_fraction_static):
+    device_index = torch.device(device).index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, fraction, mem_fraction_static)
+    if key in _budget_cache:
+        return _budget_cache[key]
+    total = int(torch.cuda.get_device_properties(device_index).total_memory)
+    total_guard = int(total * 0.3)
+    static_guard = total_guard
+    if mem_fraction_static is not None:
+        static_guard = min(
+            total_guard,
+            int(int(total * max(0.0, 1.0 - mem_fraction_static)) * fraction),
+        )
+    free, device_total = torch.cuda.mem_get_info(device_index)
+    try:
+        stats = torch.cuda.memory_stats(device_index)
+        reusable = max(
+            0,
+            int(stats["reserved_bytes.all.current"])
+            - int(stats["active_bytes.all.current"])
+            - int(stats["inactive_split_bytes.all.current"]),
+        )
+        free = min(int(device_total), int(free) + reusable)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        pass
+    budget = max(1, min(int(free * fraction), static_guard))
+    _budget_cache[key] = budget
+    return budget
+
+
+def make_paged_mqa_chunk_plan(q, max_seq_len, *, use_prefill, mem_fraction_static):
+    fraction = explicit_mqa_fraction()
+    if fraction is None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunk planning requires eager execution")
+    if q.shape[0] < 1 or max_seq_len < 1:
+        return None
+    # The ordinary paged kernel allocates a physical width rounded to page size.
+    width = max_seq_len if use_prefill else (max_seq_len + 63) // 64 * 64
+    budget = _budget_bytes(q.device, fraction, mem_fraction_static)
+    rows = min(q.shape[0], max(1, budget // (4 * width)))
+    return PagedMQAChunkPlan(rows, budget, width, use_prefill)
+
+
+def run_int8_paged_mqa_chunks(
+    fn,
+    q,
+    kv_cache,
+    weights,
+    seq_lens,
+    block_table,
+    max_seq_len,
+    *,
+    rows_per_chunk,
+    use_prefill,
+    consume_logits,
+    label="",
+):
+    """Consume each FP32 logits chunk immediately; the callback must not retain it.
+
+    Prefix-prefill reads only the first page-table row: use it exclusively for a
+    proven single-request batch with no metadata row padding. Mixed or unknown
+    ownership must use the ordinary paged kernel's per-query page table.
+    """
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    rows = q.shape[0]
+    if any(t.shape[0] != rows for t in (weights, seq_lens, block_table)):
+        raise ValueError("INT8 paged MQA inputs must have the same Q row count")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunks require eager execution")
+    for start in range(0, rows, rows_per_chunk):
+        end = min(start + rows_per_chunk, rows)
+        logits = fn(
+            q[start:end],
+            kv_cache,
+            weights[start:end],
+            seq_lens[start:end],
+            block_table[start:end],
+            None,
+            max_seq_len,
+            False,
+            use_prefill,
+        )
+        consume_logits(logits, start, end)
+        # Release before the next RHS allocation, avoiding two live chunks.
+        del logits
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -552,6 +679,26 @@ def topk_transform_flashinfer_fused(
     )
 
 
+def topk_transform_paged_bf16(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """DeepSelect paged top-k of bf16 logits: pool slots only, unordered."""
+    from sglang.kernels.ops.attention.deep_select import topk_page_transform
+
+    topk_page_transform(
+        logits,
+        out_page_indices.shape[1],
+        page_table=page_table,
+        page_size=page_size,
+        end=seq_lens.reshape(-1).to(torch.int32),
+        output_idx=out_page_indices,
+    )
+
+
 def topk_transform_paged_from_metadata(
     logits: torch.Tensor,
     metadata,
@@ -573,6 +720,16 @@ def topk_transform_paged_from_metadata(
         page_table = metadata.page_table[rows]
         out_page_indices = page_indices[rows]
         out_raw_indices = raw_indices[rows] if raw_indices is not None else None
+    if logits.dtype == torch.bfloat16:
+        assert out_raw_indices is None
+        topk_transform_paged_bf16(
+            logits,
+            seq_lens,
+            page_table,
+            out_page_indices,
+            metadata.compressed_page_size,
+        )
+        return
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
@@ -659,12 +816,13 @@ class C4IndexerBackendMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        q, weights = c4_indexer.compute_q(q_lora, positions, weights, q_lora_quant)
         if not skip_compressor:
             self.forward_indexer_compressor(
                 x=x,
@@ -858,6 +1016,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -891,6 +1050,7 @@ class C4IndexerBackendMixin:
             x = x[:num_queries]
         if q_lora.shape[0] != num_queries:
             q_lora = q_lora[:num_queries]
+            q_lora_quant = None
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -913,6 +1073,7 @@ class C4IndexerBackendMixin:
                 positions=positions,
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
+                q_lora_quant=q_lora_quant,
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
@@ -1131,6 +1292,14 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            if isinstance(
+                getattr(metadata, "fp4_decode_workspace", None),
+                FP4RowgroupDecodeWorkspace,
+            ) and (is_decode or forward_batch.forward_mode.is_target_verify()):
+                # The backend built a row-group workspace for this step: target-verify
+                # rows score like decode rows, one launch over the whole batch, a
+                # request's rows sharing each key load.
+                is_decode = True
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
@@ -1224,6 +1393,7 @@ class C4IndexerBackendMixin:
                     graph_mqa_route,
                 )
             )
+            mqa_chunk_plan = None
             if persistent_mqa_selected:
                 if not hasattr(self, "_dsv4_persistent_mqa_path_logged"):
                     logger.info(
@@ -1251,18 +1421,56 @@ class C4IndexerBackendMixin:
                     num_sms=_PERSISTENT_MQA_NUM_SMS,
                 )
             else:
-                logits = fn(
-                    q_int8,
-                    packed_cache,
-                    adjusted_weights,
-                    seq_lens_i32,
-                    block_table_i32,
-                    None,
-                    max_seq_len,
-                    False,
-                    # Extend batches use LightOp's paged MQA prefill kernel.
-                    forward_batch.forward_mode == ForwardMode.EXTEND,
-                )
+                if (
+                    _is_hcu
+                    and envs.SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION.is_set()
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and get_disagg().disaggregation_mode != "decode"
+                    and not graph_mqa_route
+                    and not get_is_capture_mode()
+                    and not use_fp4_indexer
+                    and not _use_tilelang
+                    and not _use_aiter
+                ):
+                    use_prefix_prefill = (
+                        forward_batch.batch_size == 1
+                        and indexer_metadata.compressed_seq_lens.shape[0] == query_rows
+                        and indexer_metadata.page_table.shape[0] == query_rows
+                    )
+                    mqa_chunk_plan = make_paged_mqa_chunk_plan(
+                        q_int8,
+                        max_seq_len,
+                        use_prefill=use_prefix_prefill,
+                        mem_fraction_static=get_schedule().mem_fraction_static,
+                    )
+                if mqa_chunk_plan is not None:
+                    run_int8_paged_mqa_chunks(
+                        fn,
+                        q_int8,
+                        packed_cache,
+                        adjusted_weights,
+                        seq_lens_i32,
+                        block_table_i32,
+                        max_seq_len,
+                        rows_per_chunk=mqa_chunk_plan.rows_per_chunk,
+                        use_prefill=mqa_chunk_plan.use_prefill,
+                        consume_logits=lambda logits, start, end: run_topk_transform(
+                            slice(start, end), logits
+                        ),
+                    )
+                else:
+                    logits = fn(
+                        q_int8,
+                        packed_cache,
+                        adjusted_weights,
+                        seq_lens_i32,
+                        block_table_i32,
+                        None,
+                        max_seq_len,
+                        False,
+                        # Extend batches use LightOp's paged MQA prefill kernel.
+                        forward_batch.forward_mode == ForwardMode.EXTEND,
+                    )
                 if not hasattr(self, "_dsv4_int8_indexer_path_logged"):
                     logger.info(
                         "DSV4 INT8 index-K consumer=LightOp dense INT8 Paged MQA "
@@ -1271,7 +1479,8 @@ class C4IndexerBackendMixin:
                         max_seq_len,
                     )
                     self._dsv4_int8_indexer_path_logged = True
-            run_topk_transform(all_rows, logits)
+            if mqa_chunk_plan is None:
+                run_topk_transform(all_rows, logits)
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
@@ -1417,8 +1626,7 @@ class C4Indexer(nn.Module):
         self.use_bf16_indexer_q = (
             _is_hcu
             and not self.use_fp4_indexer
-            and torch.cuda.get_device_properties().gcnArchName.split(":")[0]
-            == "gfx936"
+            and torch.cuda.get_device_properties().gcnArchName.split(":")[0] == "gfx936"
         )
         if self.use_bf16_indexer_q and envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             raise ValueError("gfx936 BF16 C4 indexer Q requires the LightOp backend")
@@ -1469,8 +1677,10 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         weight: torch.Tensor,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
-        q, _ = self.wq_b(q_lora)
+        # q_lora_quant: fp8 group quant of this q_lora already made for the attention wq_b.
+        q, _ = self.wq_b(q_lora if q_lora_quant is None else q_lora_quant)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_fp4_indexer and is_hip():
             q_fp4, q_scale = aiter_q_indexer_fp4(
@@ -1515,7 +1725,11 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
+        backend_kwargs = {}
+        if q_lora_quant is not None:
+            backend_kwargs["q_lora_quant"] = q_lora_quant
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1525,4 +1739,5 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            **backend_kwargs,
         )

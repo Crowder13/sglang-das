@@ -92,6 +92,20 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("llada2_cfg_flashinfer")
+def create_llada2_cfg_flashinfer_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("LLaDA2 CFG attention does not use an MLA backend")
+
+    from sglang.srt.layers.attention.llada2_cfg_flashinfer_backend import (
+        LLaDA2CFGFlashInferAttnBackend,
+    )
+
+    return LLaDA2CFGFlashInferAttnBackend(
+        runner, init_new_workspace=runner.init_new_workspace
+    )
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
@@ -258,6 +272,12 @@ def create_hcu_mla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
+    if _is_hcu:
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(runner, fa_impl_ver=3)
 
     major, minor = get_device_capability()
     if not _is_musa:

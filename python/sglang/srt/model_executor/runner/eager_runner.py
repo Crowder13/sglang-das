@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_local_dp_state,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_active,
@@ -50,11 +51,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-    set_tc_piecewise_forward_context,
-)
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
@@ -343,35 +340,12 @@ class EagerRunner(BaseRunner):
             else "extend"
         )
         with device_timer_ctx(model_runner.device_timer, category):
-            pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
-                _is_hip
-                and pcg_runner is not None
-                and not isinstance(pcg_runner, EagerRunner)
-                and not cp_active
+            if cp_active and (
+                not get_parallel().enable_cp_tp_group_sharing
+                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
-                # HIP PCG eager fallback: enter the PCG context so Dynamo guards
-                # and PCG-specific MoE/attention paths stay consistent.
-                with (
-                    enable_tc_piecewise_cuda_graph(),
-                    set_tc_piecewise_forward_context(
-                        forward_batch,
-                        model_runner.attention_layers,
-                        getattr(model_runner.model, "quant_config", None),
-                        model_runner.moe_layers,
-                        model_runner.moe_fusions,
-                        dsa_indexers=model_runner.dsa_indexers,
-                        mha_companion_layers=model_runner.mha_companion_layers,
-                    ),
-                ):
-                    ret = model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
-            # Under CP-TP group sharing the model owns the CP row layout.
-            elif cp_active and not get_parallel().enable_cp_tp_group_sharing:
+                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
+                # Other group-sharing models keep owning the layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -390,18 +364,36 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        input_embeds = kwargs.get("input_embeds")
-        if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
+            input_embeds, positions, model_kwargs = prepare_inputs(
+                forward_batch, **kwargs
+            )
+        else:
+            input_embeds = kwargs.get("input_embeds")
+            if input_embeds is None:
+                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            positions = forward_batch.positions
+            model_kwargs = {}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         with cp_shard_model_inputs(
             input_embeds,
-            forward_batch.positions,
+            positions,
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-            model_kwargs = {"input_embeds": sharded_input_embeds}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
-                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            position_tokens = sharded_positions.shape[-1]
+            if sharded_input_embeds.shape[0] != position_tokens:
+                parallel = get_parallel()
+                raise RuntimeError(
+                    "CP model input shard mismatch: "
+                    f"embeddings={tuple(sharded_input_embeds.shape)}, "
+                    f"positions={tuple(sharded_positions.shape)}, "
+                    f"dp_rank={parallel.attn_dp_rank}, "
+                    f"cp_rank={parallel.attn_cp_rank}"
+                )
+            model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
                 model_input_ids,
                 sharded_positions,
@@ -476,7 +468,18 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        global_cp_tokens = forward_batch.global_cp_num_tokens_cpu
+        use_cp_local_dp = (
+            get_parallel().attn_cp_size > 1
+            and global_cp_tokens is not None
+            and any(global_cp_tokens)
+        )
+        cp_context = (
+            cp_local_dp_state(forward_batch)
+            if use_cp_local_dp
+            else contextlib.nullcontext()
+        )
+        with device_timer_ctx(model_runner.device_timer, "idle"), cp_context:
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

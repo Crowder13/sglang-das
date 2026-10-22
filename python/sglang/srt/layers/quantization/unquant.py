@@ -160,6 +160,8 @@ _run_splitk_dense = None
 _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
+_warp_splitk_tactic = None
+_run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
@@ -176,14 +178,10 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (2, 512, 8192): (64, 8, 4, 12),
     (4, 512, 8192): (64, 8, 4, 10),
     (8, 512, 8192): (64, 8, 4, 12),
+    (12, 512, 8192): (64, 8, 4, 12),
     (16, 512, 8192): (64, 8, 4, 12),
     (24, 512, 8192): (64, 8, 4, 12),
     (32, 512, 8192): (64, 16, 4, 9),
-    (1, 2304, 8192): (128, 8, 4, 6),
-    (2, 2304, 8192): (64, 8, 2, 12),
-    (4, 2304, 8192): (128, 8, 4, 6),
-    (8, 2304, 8192): (64, 8, 4, 10),
-    (16, 2304, 8192): (64, 16, 4, 9),
     (24, 2304, 8192): (64, 32, 2, 9),
     (32, 2304, 8192): (64, 32, 2, 9),
     (1, 2560, 8192): (64, 8, 2, 10),
@@ -193,6 +191,23 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # MuseSpark TP8 unpooler slice; only swept M are listed.
+    (4, 1024, 4096): (64, 8, 4, 12),
+    (8, 1024, 4096): (64, 8, 4, 12),
+    (12, 1024, 4096): (64, 16, 4, 8),
+    (16, 1024, 4096): (64, 16, 4, 8),
+    # MuseSpark TP4 qkvg and pooler/unpooler slices on GB300, same method;
+    # only swept M are listed; other M were not tuned and stay on TGV/cuBLAS.
+    (24, 4608, 8192): (64, 32, 2, 9),
+    (32, 4608, 8192): (64, 32, 2, 9),
+    (1, 1024, 8192): (64, 16, 4, 10),
+    (2, 1024, 8192): (64, 16, 4, 10),
+    (4, 1024, 8192): (64, 16, 4, 10),
+    (8, 1024, 8192): (64, 16, 4, 10),
+    (12, 1024, 8192): (64, 16, 4, 10),
+    (16, 1024, 8192): (64, 16, 4, 10),
+    (24, 1024, 8192): (64, 16, 4, 10),
+    (32, 1024, 8192): (64, 16, 4, 10),
     # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
     # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
     (1, 320, 2560): (64, 8, 4, 11),
@@ -237,9 +252,54 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (8, 4120, 2560): (64, 8, 2, 6),
 }
 
+# FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
+# MuseSpark TP4/TP8 on GB300 of the per-M best.
+# Takes precedence over _BF16_SPLITK_TUNED_TACTICS.
+_BF16_WARP_SPLITK_TUNED_TACTICS = {
+    # TP4 qkvg, o_proj and unpooler slice.
+    (1, 4608, 8192): (32, 8, 256, 10, 2),
+    (2, 4608, 8192): (32, 8, 256, 10, 2),
+    (4, 4608, 8192): (32, 8, 256, 10, 2),
+    (8, 4608, 8192): (32, 8, 256, 10, 2),
+    (12, 4608, 8192): (32, 16, 256, 9, 2),
+    (16, 4608, 8192): (32, 16, 256, 9, 2),
+    (1, 8192, 2048): (16, 8, 256, 4, 2),
+    (2, 8192, 2048): (16, 8, 256, 4, 2),
+    (4, 8192, 2048): (16, 8, 256, 4, 2),
+    (8, 8192, 2048): (16, 8, 256, 4, 2),
+    (12, 8192, 2048): (32, 16, 256, 4, 2),
+    (16, 8192, 2048): (32, 16, 256, 4, 2),
+    (1, 2048, 4096): (16, 8, 256, 15, 2),
+    (2, 2048, 4096): (16, 8, 256, 15, 2),
+    (4, 2048, 4096): (16, 8, 256, 15, 2),
+    (8, 2048, 4096): (16, 8, 256, 15, 2),
+    (12, 2048, 4096): (16, 16, 256, 12, 2),
+    (16, 2048, 4096): (16, 16, 256, 12, 2),
+    (24, 2048, 4096): (32, 16, 256, 9, 2),
+    (32, 2048, 4096): (32, 16, 256, 9, 2),
+    # TP8 qkvg, o_proj and unpooler slice.
+    (1, 2304, 8192): (16, 8, 256, 16, 2),
+    (2, 2304, 8192): (16, 8, 256, 16, 2),
+    (4, 2304, 8192): (16, 8, 256, 16, 2),
+    (8, 2304, 8192): (16, 8, 256, 16, 2),
+    (12, 2304, 8192): (16, 16, 256, 13, 2),
+    (16, 2304, 8192): (16, 16, 256, 13, 2),
+    (1, 8192, 1024): (32, 8, 128, 8, 2),
+    (2, 8192, 1024): (32, 8, 128, 8, 2),
+    (4, 8192, 1024): (32, 8, 128, 8, 2),
+    (8, 8192, 1024): (32, 8, 128, 8, 2),
+    (12, 8192, 1024): (32, 16, 256, 4, 2),
+    (16, 8192, 1024): (32, 16, 256, 4, 2),
+    (1, 1024, 4096): (16, 8, 256, 16, 2),
+    (2, 1024, 4096): (16, 8, 256, 16, 2),
+    (24, 1024, 4096): (16, 16, 256, 10, 2),
+    (32, 1024, 4096): (16, 16, 256, 10, 2),
+}
+
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
-    return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+    key = (m, n, k)
+    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
 def precompile_splitk_tactics() -> bool:
@@ -248,7 +308,7 @@ def precompile_splitk_tactics() -> bool:
     if not _enable_bf16_splitk_gemm:
         return False
     device = torch.cuda.current_device()
-    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
@@ -270,6 +330,7 @@ def initialize_bf16_gemm_config() -> None:
     global _direct_default_tactic
     global _prefer_direct
     global _run_direct_dense
+    global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
 
     backend_str = get_exec().kernel.bf16_gemm_backend
@@ -283,8 +344,8 @@ def initialize_bf16_gemm_config() -> None:
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_gemv():
-        if torch.cuda.get_device_capability()[0] != 9:
-            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+        if torch.cuda.get_device_capability()[0] not in (9, 12):
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
@@ -324,12 +385,18 @@ def initialize_bf16_gemm_config() -> None:
             SplitKTactic,
             run_splitk_dense,
         )
+        from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+            WarpSplitKTactic,
+            run_warp_splitk_dense,
+        )
 
         _splitk_tactic = SplitKTactic
         _run_splitk_dense = run_splitk_dense
         _direct_default_tactic = default_tactic
         _prefer_direct = prefer_direct_bf16_gemm_sm100
         _run_direct_dense = run_direct_dense
+        _warp_splitk_tactic = WarpSplitKTactic
+        _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
 
     _BF16_GEMM_BACKEND = backend
@@ -348,7 +415,12 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    if bias is None and _prefer_direct(m, n, k):
+    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
+    if warp_tactic is not None:
+        _run_warp_splitk_dense(
+            x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
+        )
+    elif bias is None and _prefer_direct(m, n, k):
         tactic = _direct_default_tactic(m, n, k)
         _run_direct_dense(x_2d, weight.T, out, True, tactic)
     else:
@@ -544,7 +616,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_cutedsl()
+            (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
@@ -793,6 +865,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
             and self._aiter_ck_moe_supported(layer)
             and not layer._skip_aiter_moe_shuffle
+            and layer.moe_runner_config.gemm1_alpha is None
+            and layer.moe_runner_config.gemm1_clamp_limit is None
         )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
@@ -825,6 +899,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and hasattr(layer, "dispatcher")
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache sizing.
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
         if self.use_flashinfer_cutlass:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
@@ -910,6 +988,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         if (
             _is_hcu
             and _use_marlin_w16a16_moe
+            and not getattr(self, "_use_hcu_unified_aiter", False)
             and not _use_aiter_w16a16_moe
             and not self.use_deepep
             and not getattr(layer, "use_nn_moe", False)
@@ -935,8 +1014,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                         raise RuntimeError("Unexpected MoE hidden dims")
                     if K % 16 != 0 or K % 32 != 0 or N % 16 != 0 or twoN % 32 != 0:
                         raise RuntimeError("Marlin packing requires alignment")
-
-                    from torch.nn.parameter import Parameter
 
                     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
                         w16a16_marlin_weight,
@@ -1153,20 +1230,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
         self._aiter_runner: Optional[MoeRunner] = None
-        if (
-            _use_aiter
-            and (
-                get_moe_runner_backend().is_auto()
-                or get_moe_runner_backend().is_aiter()
-            )
-            and get_moe_a2a_backend().is_none()
-        ):
+        aiter_backend = get_moe_runner_backend()
+        aiter_requested = aiter_backend.is_aiter() or (
+            _use_aiter and aiter_backend.is_auto()
+        )
+        unified_activation = _is_hcu and (
+            moe_runner_config.gemm1_alpha is not None
+            or moe_runner_config.gemm1_clamp_limit is not None
+        )
+        if _is_hip and aiter_requested and get_moe_a2a_backend().supports_aiter():
             reason = self._aiter_ck_moe_unsupported_reason(layer)
-            if reason is None:
+            if unified_activation or reason is None:
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
                 )
-            elif get_moe_runner_backend().is_aiter():
+            elif aiter_backend.is_aiter() and not _is_hcu:
+                # Only non-HCU forwards actually use _aiter_runner; on HCU the
+                # runner stays unused (marlin/triton handle the MoE), so a
+                # hard error here would reject serveable shape configs.
                 raise ValueError(
                     f"moe_runner_backend=aiter is not supported: {reason}; "
                     "use --moe-runner-backend triton."
@@ -1176,6 +1257,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     f"aiter CK fused-MoE does not support this layer: {reason}; "
                     "using triton MoE runner."
                 )
+
+        self._use_hcu_unified_aiter = (
+            unified_activation and self._aiter_runner is not None
+        )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -1212,6 +1297,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if _is_hcu and getattr(self, "_use_hcu_unified_aiter", False):
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
+
+            dispatcher = layer.dispatcher
+            expert_map = getattr(dispatcher, "aiter_expert_map_gpu", None)
+            if expert_map is None:
+                expert_map = getattr(dispatcher, "local_expert_mapping", None)
+            if expert_map is None:
+                expert_map = getattr(dispatcher, "expert_mask_gpu", None)
+            quant_info = AiterMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                expert_mask=expert_map,
+            )
+            return self._aiter_runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -1348,13 +1449,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 )
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert (
-                        topk_weights.dim() == 2
-                    ), "`topk_weights` should be (num_tokens, topk)"
+                    assert topk_weights.dim() == 2, (
+                        "`topk_weights` should be (num_tokens, topk)"
+                    )
                     _, tk = topk_weights.shape
-                    assert (
-                        tk == 1
-                    ), "HCU AITER W16A16 path: apply_router_weight_on_input requires topk=1"
+                    assert tk == 1, (
+                        "HCU AITER W16A16 path: apply_router_weight_on_input requires topk=1"
+                    )
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
 
@@ -1369,8 +1470,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     )
 
                 M, K = x.shape
-                E = self.moe_runner_config.num_experts
-                if w1.shape[0] != E or w2.shape[0] != E:
+                # Triton StandardDispatcher remaps topk_ids to the local EP
+                # range, so kernel E must match the sharded weight dim0
+                # (num_local_experts), not the global expert count.
+                E = int(w1.shape[0])
+                if w2.shape[0] != E:
                     raise RuntimeError(
                         "AITER W16A16 MoE expert count mismatch: "
                         f"E={E}, w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}"
@@ -1404,37 +1508,48 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     dtype=x.dtype,
                     quant_type=MoeQuantType.W16A16,
                 )
-                if not status:
-                    raise RuntimeError(
-                        "[aiter_moe_w16a16] no suitable backend found: "
-                        f"M={M}, N1={N1}, N2={N2}, K={K}, E={E}, topk={top_k}"
-                    )
-                if moe_cfg.solution_type not in {
-                    MoeSolutionType.ASM,
-                    MoeSolutionType.TRITON,
-                    MoeSolutionType.CK,
-                }:
-                    raise RuntimeError(
-                        f"Unsupported solution_type: {moe_cfg.solution_type}"
-                    )
-                if moe_cfg.quant_type != MoeQuantType.W16A16:
-                    raise RuntimeError(f"Unexpected quant_type: {moe_cfg.quant_type}")
-                output = aiter_moe(
-                    hidden_states=x,
-                    w1=w1,
-                    w2=w2,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    moe_config=moe_cfg,
-                    inplace=moe_runner_config.inplace,
-                    w1_scale=None,
-                    w2_scale=None,
-                    activation=activation,
-                    block_shape=None,
-                    global_num_experts=E,
-                    routed_scaling_factor=routed_scaling_factor,
+                use_aiter_w16 = bool(
+                    status
+                    and moe_cfg is not None
+                    and moe_cfg.solution_type
+                    in {
+                        MoeSolutionType.ASM,
+                        MoeSolutionType.TRITON,
+                        MoeSolutionType.CK,
+                    }
+                    and moe_cfg.quant_type == MoeQuantType.W16A16
                 )
-                return StandardCombineInput(hidden_states=output)
+                if use_aiter_w16:
+                    output = aiter_moe(
+                        hidden_states=x,
+                        w1=w1,
+                        w2=w2,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        moe_config=moe_cfg,
+                        inplace=moe_runner_config.inplace,
+                        w1_scale=None,
+                        w2_scale=None,
+                        activation=activation,
+                        block_shape=None,
+                        global_num_experts=E,
+                        routed_scaling_factor=routed_scaling_factor,
+                    )
+                    return StandardCombineInput(hidden_states=output)
+                logger.warning_once(
+                    "[unquant] aiter W16A16 unavailable for "
+                    f"M={M}, E={E}, N1={N1}, N2={N2}, K={K}, topk={top_k}, "
+                    f"status={status}, sol={getattr(moe_cfg, 'solution_type', None)}; "
+                    "falling back to triton"
+                )
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                    fuse_swiglu_interleaved=self.w13_swiglu_interleaved,
+                )
+                return self.runner.run(dispatch_output, quant_info)
 
             else:
                 quant_info = TritonMoeQuantInfo(

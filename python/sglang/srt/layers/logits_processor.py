@@ -24,9 +24,13 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    gathered_softcap_logits,
+)
+from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.kernels.ops.activation.softcap import (
+    softcap_row_argmax,
     softcap_to_float32_logits,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
@@ -80,6 +84,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedLinearMethod",
     "PackWeightMethod",
 }
+
 
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
@@ -135,62 +140,6 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
 
 
-def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
-        return False
-
-    method_name = type(quant_method).__name__
-    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
-        return False
-
-    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
-    # only when the runtime tensor layout matches that method.
-    if method_name == "ModelOptFp4LinearMethod":
-        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        ):
-            return True
-        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale_interleaved",
-                "alpha",
-                "input_scale_inv",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptNvFp4A16LinearMethod":
-        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptFp8LinearMethod":
-        return (
-            lm_head.weight.dtype == torch.float8_e4m3fn
-            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
-        )
-
-    return True
-
-
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
 # [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
@@ -225,6 +174,12 @@ class LogitsProcessorOutput:
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
 
+    # Draft decode VP returns a deterministic top-1 proposal without full logits.
+    draft_top1_token_ids: Optional[torch.Tensor] = None
+    draft_top1_probs: Optional[torch.Tensor] = None
+    # Greedy EAGLE3 fast path.  When populated, the draft worker consumes
+    # these ids directly and ``next_token_logits`` is intentionally None.
+    draft_topk_index: Optional[torch.Tensor] = None
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
@@ -475,6 +430,9 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
             )
+        # Set before graph capture by a speculative worker that finishes the TP
+        # gather itself (see finish_deferred_gather / deferred_argmax).
+        self.defer_verify_gather = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -662,6 +620,114 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def forward_draft_top1_fp8(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        fp8_weight: Optional[torch.Tensor],
+        weight_scale: Optional[torch.Tensor],
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
+        backend: str = "lightop",
+    ) -> LogitsProcessorOutput:
+        """Greedy EAGLE3 LM-head without materializing vocabulary logits."""
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            fp8_lm_head_top1,
+        )
+        from sglang.kernels.ops.speculative.topk1 import (
+            draft_topk1_select_candidates,
+        )
+
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError("FP8 draft Top-1 does not support input logprobs")
+        if self.final_logit_softcapping is not None:
+            raise RuntimeError("FP8 draft Top-1 does not support logit softcapping")
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        pruned_states, local_states = self._gather_dp_attn_hidden_states(
+            pruned_states, logits_metadata
+        )
+
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise RuntimeError("FP8 draft Top-1 does not support added vocabulary")
+        valid_local_vocab = shard.org_vocab_end_index - shard.org_vocab_start_index
+        if backend not in ("lightop", "lightop_fp8"):
+            raise RuntimeError(
+                "SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND must be lightop_fp8, got "
+                f"{backend!r}"
+            )
+        if pruned_states.numel() == 0:
+            # Idle DP ranks still execute the EAGLE draft control flow.  Do
+            # not send their empty [0, K] input to LightOp, which
+            # rejects M=0 and logs status=3 on every speculative step.
+            local_values = torch.empty(
+                (0,), dtype=torch.float32, device=pruned_states.device
+            )
+            local_indices = torch.empty(
+                (0,), dtype=torch.int32, device=pruned_states.device
+            )
+        else:
+            if fp8_weight is None or weight_scale is None:
+                raise RuntimeError("FP8 draft LM-head weights were not initialized")
+            local_values, local_indices = fp8_lm_head_top1(
+                pruned_states,
+                fp8_weight,
+                weight_scale,
+                valid_vocab_size=valid_local_vocab,
+            )
+        global_ids = local_indices.to(torch.float32).add_(shard.org_vocab_start_index)
+        candidates = torch.stack((local_values, global_ids), dim=-1)
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                raise RuntimeError(
+                    "FP8 draft Top-1 currently requires the model TP group"
+                )
+            candidates = get_parallel().tp_group.all_gather(candidates, dim=-1)
+            candidates = candidates.view(candidates.shape[0], -1, 2)
+            global_top1 = draft_topk1_select_candidates(candidates)
+        else:
+            global_top1 = global_ids.to(torch.int64).view(-1, 1).contiguous()
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_top1 = torch.empty(
+                (local_states.shape[0], 1),
+                dtype=torch.int64,
+                device=global_top1.device,
+            )
+            dp_scatter(local_top1, global_top1, logits_metadata)
+        else:
+            local_top1 = global_top1
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states_to_store,
+            draft_topk_index=local_top1,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     def _get_pruned_states(
         self,
@@ -953,6 +1019,18 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        if self._can_gather_softcap_fused(
+            logits, local_hidden_states, lm_head, logits_metadata
+        ):
+            if (
+                self.defer_verify_gather
+                and logits_metadata.forward_mode.is_target_verify()
+            ):
+                return logits
+            return self._gather_softcap_fused(
+                logits, logits_metadata, use_logits_buffer
+            )
+
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
@@ -1003,6 +1081,76 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _can_gather_softcap_fused(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        return (
+            self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and bool(self.final_logit_softcapping)
+            and logits.is_cuda
+            and not (_is_npu or _is_cpu)
+            and logits.dtype == torch.float32
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
+    def is_deferred_shard(self, logits: torch.Tensor) -> bool:
+        return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
+
+    def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
+        """Full softcapped logits from a target-verify vocab shard."""
+        return self._gather_softcap_fused(logits, None, use_buffer=False)
+
+    def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """``argmax`` of the full softcapped logits from a target-verify vocab
+        shard, gathering only each rank's row maxima. Ties resolve to the lowest
+        vocab index, as ``torch.argmax`` over the gathered row does."""
+        group = get_parallel().tp_group
+        num_tokens, shard_width = logits.shape
+        col_offset = group.rank_in_group * shard_width
+        valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+        local = softcap_row_argmax(
+            logits, self.final_logit_softcapping, valid_width, col_offset
+        )
+        gathered = torch.empty(
+            (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
+        )
+        group.all_gather_into_tensor(gathered.view(-1, 2), local)
+        best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
+        return gathered[..., 1].gather(0, best_rank).squeeze(0).long()
+
+    def _gather_softcap_fused(
+        self,
+        logits: torch.Tensor,
+        logits_metadata: Optional[LogitsMetadata],
+        use_buffer: bool,
+    ) -> torch.Tensor:
+        group = get_parallel().tp_group
+        num_tokens, shard_width = logits.shape
+        gathered = torch.empty(
+            (group.world_size, num_tokens, shard_width),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        group.all_gather_into_tensor(gathered.view(-1, shard_width), logits)
+        width = min(self.vocab_size, group.world_size * shard_width)
+        output = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if output is None or tuple(output.shape) != (num_tokens, width):
+            output = torch.empty(
+                (num_tokens, width), dtype=torch.float32, device=logits.device
+            )
+        assert output.dtype == torch.float32
+        return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
 
     def _compute_lm_head(
         self,
@@ -1107,7 +1255,9 @@ class LogitsProcessor(nn.Module):
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
+            # AITER AG requires dim-0 concatenation. Keep the stacked owner for
+            # the token-major vocabulary permutation below; flatten is a view.
+            attn_tp_all_gather_into_tensor(global_logits.flatten(0, 1), logits)
             global_logits = global_logits.permute(1, 0, 2).reshape(
                 logits.shape[0], self.vocab_size
             )
@@ -1440,10 +1590,6 @@ def _reassemble_tp_lm_head_all_to_all_output(
         .permute(1, 0, 2)
         .reshape(local_rows, tp_size * vocab_shard)
     )
-
-
-def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
-    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:

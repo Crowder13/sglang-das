@@ -2,8 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -11,6 +9,9 @@ from sglang.srt.arg_groups.speculative_hook import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_attention_sliding_window_size,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -179,42 +180,21 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                 _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-            with self.assertRaisesRegex(ValueError, "static"):
-                _handle_dspark(server_args)
+        for backend in ("deepep", "megamoe"):
+            server_args = self._dp_server_args(moe_a2a_backend=backend)
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+                with self.assertRaisesRegex(ValueError, "static"):
+                    _handle_dspark(server_args)
 
 
-class TestDsparkFoldedSamplingDefault(CustomTestCase):
-    def test_sharded_greedy_default_and_sampling_override(self):
-        from sglang.srt.environ import DsparkFoldedSampling, envs
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            _resolve_folded_sampling,
+class TestDsparkSlidingWindowCompatibility(CustomTestCase):
+    def test_official_dspark_swa_field_is_used_when_qwen3_drops_top_level(self):
+        config = SimpleNamespace(
+            layer_types=["sliding_attention"] * 6,
+            sliding_window=None,
+            dflash_config={"use_swa": True, "swa_window_size": 1024},
         )
-
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
-            markov_head=SimpleNamespace(supports_sharded_greedy=True),
-        )
-        args = dict(
-            model=model,
-            gamma=5,
-            max_bs=64,
-            device="cpu",
-            tp_rank=0,
-            available_memory_gb=16,
-        )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertFalse(_resolve_folded_sampling(**args))
-            model.markov_head.supports_sharded_greedy = False
-            self.assertTrue(_resolve_folded_sampling(**args))
-        model.markov_head.supports_sharded_greedy = True
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.FORCE.value
-        ):
-            self.assertTrue(_resolve_folded_sampling(**args))
+        self.assertEqual(get_dflash_attention_sliding_window_size(config), 1023)
 
 
 if __name__ == "__main__":

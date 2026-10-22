@@ -291,14 +291,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant. Only the offline ModelSlim path
-        # (which carries a per-layer quant_model_description) may quantise the
-        # gate — if the checkpoint stored it as MXFP8 it is loaded
-        # and dequantised correctly instead of cast to bf16 without its block scale.
-        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
+        # ModelSlim and compressed-tensors gates must retain checkpoint scales.
+        # Other online FP8 paths keep the gate in BF16.
         gate_quant_config = (
             quant_config
-            if (quant_config is not None and quant_config.get_name() == "modelslim")
+            if (
+                quant_config is not None
+                and quant_config.get_name() in ("modelslim", "compressed_tensors")
+            )
             else None
         )
         self.gate = ReplicatedLinear(
@@ -913,9 +913,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_next_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
@@ -939,13 +938,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: Qwen3MoeConfig, layer_id: int):
+        """The stages a Qwen3-MoE layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        # Qwen3MoE all layers are sparse and have no nextn now
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
@@ -42,6 +43,11 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.goodput import (
+    GOODPUT_SLO_METRICS,
+    calculate_goodput,
+    print_goodput,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -105,6 +111,9 @@ class RequestFuncOutput:
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
+    # Prompt length reported by the server. ``prompt_len`` starts with the
+    # dataset's nominal length and is replaced with this value when available.
+    server_prompt_len: Optional[int] = None
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
@@ -730,6 +739,7 @@ async def async_request_sglang_generate(
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
+        stream_failed = False
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -753,7 +763,36 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
+                            # Native /generate creates the StreamingResponse
+                            # before scheduler-side validation completes. A
+                            # rejected request can therefore have HTTP 200 and
+                            # carry the actual error inside an SSE chunk.
+                            if "error" in data:
+                                error = data["error"]
+                                output.error = (
+                                    error.get("message", str(error))
+                                    if isinstance(error, dict)
+                                    else str(error)
+                                )
+                                stream_failed = True
+                                break
+
                             _meta_info = data.get("meta_info") or {}
+                            server_prompt_len = _meta_info.get("prompt_tokens")
+                            if isinstance(server_prompt_len, int):
+                                output.server_prompt_len = server_prompt_len
+                                output.prompt_len = server_prompt_len
+
+                            finish_reason = _meta_info.get("finish_reason") or {}
+                            if (
+                                isinstance(finish_reason, dict)
+                                and finish_reason.get("type") == "abort"
+                            ):
+                                output.error = finish_reason.get(
+                                    "message", "Generation aborted."
+                                )
+                                stream_failed = True
+                                break
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -793,10 +832,15 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                    output.generated_text = generated_text
-                    output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    if stream_failed:
+                        output.generated_text = ""
+                        output.success = False
+                        output.output_len = 0
+                    else:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.output_len = output_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1159,7 +1203,7 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
+                total_input += outputs[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
@@ -1666,6 +1710,11 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+    goodput = None
+    if args.goodput:
+        goodput = calculate_goodput(
+            outputs=outputs, goodput_slos=dict(args.goodput), dur_s=benchmark_duration
+        )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1735,6 +1784,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if goodput:
+        print_goodput(goodput)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1894,6 +1945,9 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        if goodput:
+            result.update(msgspec.structs.asdict(goodput))
+
         if args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
@@ -1928,6 +1982,7 @@ async def benchmark(
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
+        "server_prompt_lens": [output.server_prompt_len for output in outputs],
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
@@ -1970,6 +2025,13 @@ def set_global_args(args_: argparse.Namespace):
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
+
+    # The Rust client owns the whole run, from dataset to result file, so hand
+    # it the arguments before this module sets up anything of its own.
+    if getattr(args, "rust_client", False):
+        from sglang.benchmark.rust_client import run_rust_benchmark
+
+        return run_rust_benchmark(args)
 
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
@@ -2018,6 +2080,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "goodput"):
+        args.goodput = None
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2219,16 +2284,34 @@ def _finite_positive_float(value) -> float:
     return parsed
 
 
+def _goodput_slo(pair: str) -> Tuple[str, float]:
+    """argparse type for one --goodput KEY:VALUE entry; VALUE is in milliseconds."""
+    name, _, value = pair.partition(":")
+    if name not in GOODPUT_SLO_METRICS:
+        raise argparse.ArgumentTypeError(
+            f"expected KEY:VALUE with KEY in {', '.join(GOODPUT_SLO_METRICS)}, "
+            f"got {pair!r}"
+        )
+    return name, _finite_positive_float(value)
+
+
 def _validate_parsed_gsp_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject malformed GSP distribution/alpha combinations at parse time.
+    """Reject unsupported GSP argument combinations at parse time.
 
     Invoked from the CLI entry point right after ``parser.parse_args()`` so
     users see a clear argparse-style error before any server, model, or
     tokenizer setup runs and masks the real cause with an unrelated network
     failure.
     """
+    if (
+        getattr(args, "dataset_name", None) == "generated-shared-prefix"
+        and getattr(args, "tokenize_prompt", False)
+        and getattr(args, "gsp_num_turns", 1) > 1
+    ):
+        parser.error("--tokenize-prompt requires --gsp-num-turns=1")
+
     distribution = getattr(args, "gsp_group_distribution", None)
     alpha = getattr(args, "gsp_zipf_alpha", None)
     if distribution == "zipf" and alpha is None:
@@ -2446,6 +2529,16 @@ def cli_main():
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
+    )
+    parser.add_argument(
+        "--goodput",
+        nargs="+",
+        type=_goodput_slo,
+        default=None,
+        metavar="KEY:VALUE",
+        help="SLOs for goodput as KEY:VALUE pairs in milliseconds, with KEY in "
+        f"{', '.join(GOODPUT_SLO_METRICS)}, e.g. --goodput ttft:500 tpot:50. A request "
+        "counts toward goodput only if it succeeds and meets every given SLO.",
     )
     parser.add_argument(
         "--print-requests",
@@ -2706,11 +2799,6 @@ def cli_main():
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
     )
     group.add_argument(
-        "--gsp-input-ids",
-        action="store_true",
-        help="Send raw random token ids as input_ids instead of decoded text, so the server skips tokenization before prefill. Statistics are suppressed like --gsp-fast-prepare; use for pure prefill/decode pressure tests.",
-    )
-    group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
         help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
@@ -2803,7 +2891,39 @@ def cli_main():
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
+    parser.add_argument(
+        "--rust-client",
+        action="store_true",
+        help="Run through the Rust client (sglang.srt.rust_extensions._bench), "
+        "which parses each response stream on its own thread instead of one "
+        "shared asyncio thread. Same metrics and result keys; fewer backends "
+        "and datasets (see rust/sglang-bench/README.md). For a command line "
+        "that skips this module's model-tooling imports entirely, run "
+        "`python -m sglang.benchmark.rust_client` instead.",
+    )
+    parser.add_argument(
+        "--rust-worker-threads",
+        type=int,
+        default=None,
+        help="Response-stream parsing threads for --rust-client. "
+        "Defaults to the available parallelism.",
+    )
     args = parser.parse_args()
+    if args.rust_worker_threads is not None and not args.rust_client:
+        parser.error("--rust-worker-threads requires --rust-client")
+    if args.rust_client:
+        # Checked here so an unsupported combination is a usage error rather
+        # than a traceback; `run_benchmark` still raises for a programmatic
+        # caller, which has no parser to report through.
+        from sglang.benchmark.rust_client import (
+            UnsupportedByRustClient,
+            check_supported,
+        )
+
+        try:
+            check_supported(args)
+        except UnsupportedByRustClient as error:
+            parser.error(str(error))
     _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
 

@@ -65,7 +65,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK
@@ -88,7 +88,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -756,8 +756,8 @@ class Glm4MoeDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Glm4MoeSparseMoeBlock(
@@ -785,14 +785,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
         # Detect if QKV uses aiter FP8 per-token quant so we can fuse
@@ -840,10 +834,29 @@ class Glm4MoeDecoderLayer(nn.Module):
             self.self_attn.qkv_proj, "attn"
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
         )
 
     def forward(
@@ -915,6 +928,7 @@ class Glm4MoeModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Glm4MoeDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
@@ -1301,6 +1315,9 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # ModelConfig rewrites a GLM draft's architecture to this class's own name,
+    # so the inherited DeepSeek name would never match what the gate compares.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
@@ -1308,6 +1325,41 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    def __init__(self, config, quant_config=None, prefix=""):
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        if not _is_hcu or get_model().quantization != "slimquant_w4a8_marlin":
+            return
+
+        experts = self.model.decoder.mlp.experts
+        if (
+            not isinstance(experts, DeepEPMoE)
+            or experts.deprecate_flag
+            or experts.quant_config is not None
+            or experts.w13_weight.dtype != torch.bfloat16
+        ):
+            return
+
+        # Only the BF16 GLM MTP paired with a W4A8 target needs this override.
+        # Its DeepEP kernels consume canonical BF16 weights and activations.
+        experts.use_fp8_w8a8 = False
+        experts.use_w4afp8 = False
+        experts.use_w4a8_marlin = False
+        experts.use_w8a8_marlin = False
+        experts.use_w4a16_marlin = False
+        experts.use_bf16_marlin = True
+        experts._skip_aiter_moe_shuffle = True
+        experts.dispatcher.set_quant_config(
+            {"dispatcher_output_dtype": "bf16", "preserve_input_dtype": True}
+        )
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     @classmethod
     def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
@@ -1361,6 +1413,21 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         return super().load_weights(weights)
 
     def _resolve_nextn_quant_config(self, config, quant_config):
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "slimquant_w4a8_marlin"
+        ):
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+
+            # The bundled MTP block may remain BF16 in an INT4 checkpoint.
+            if should_ignore_layer(
+                layer_name=f"model.layers.{config.num_hidden_layers}",
+                ignore=quant_config.ignore or (),
+            ):
+                return None
+
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 

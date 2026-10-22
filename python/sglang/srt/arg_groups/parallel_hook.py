@@ -62,22 +62,31 @@ def handle_deprecated_dp_attention(server_args: Any):
     )
 
 
-def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    inkling = architecture in (
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    )
+    kimi_k3 = architecture in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
     if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
-        # Neither model enters the input-scattered attention scope. Preserve
-        # their existing ordinary execution and make the effective flag explicit.
+    if (
+        nemotron or longcat or kimi_k3 or inkling
+    ) and cfg.enable_attn_tp_input_scattered:
+        # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
-            model_type,
+            architecture,
         )
         return {"enable_attn_tp_input_scattered": False}
     return {}
@@ -100,7 +109,7 @@ def handle_context_parallelism(server_args: Any):
             server_args,
             "boundary_parallelism",
             **_boundary_parallelism_overrides(
-                cfg, model_config.hf_text_config.model_type
+                cfg, model_config.hf_text_config.model_type, model_arch
             ),
         )
         if (
@@ -179,8 +188,20 @@ def handle_context_parallelism(server_args: Any):
         )
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert cfg.moe_dp_size == 1, (
-            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        # DP attention and MoE-DP may use the same DP partition while CP is
+        # disabled. In that layout (EP=1, attn-DP == MoE-DP), attention TP
+        # and MoE TP are identical contiguous rank groups, so no CP token
+        # sharing is required.
+        moe_dp_matches_attn_dp = (
+            cfg.enable_dp_attention
+            and view.attn_cp_size == 1
+            and cfg.moe_dp_size == cfg.dp_size
+            and view.ep_size == 1
+        )
+        assert cfg.moe_dp_size == 1 or moe_dp_matches_attn_dp, (
+            "attn_cp_size != moe_dp_size requires moe_dp_size == 1, or "
+            "the aligned DP-attention layout: attn_cp_size=1, ep_size=1, "
+            "and moe_dp_size=dp_size"
         )
 
     from sglang.srt.layers.cp.base import init_cp_strategy
@@ -238,6 +259,8 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
+    if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
+        raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
@@ -307,6 +330,12 @@ def handle_data_parallelism(server_args: Any):
             "_handle_data_parallelism",
             schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
         )
+        if envs.SGLANG_RUST_SERVER.get():
+            declare_resolution(
+                server_args,
+                "_handle_data_parallelism",
+                enable_dp_attention_local_control_broadcast=True,
+            )
         assert cfg.tp_size % cfg.attn_dp_size == 0
         original_chunked_prefill_size = cfg.chunked_prefill_size
         declare_resolution(
@@ -554,6 +583,43 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
+        from sglang.srt.elastic_ep.topology import physical_ep_size_to_dp_size
+
+        try:
+            divisor = cfg.attn_dp_size * resolved.attn_cp_size
+            if (
+                cfg.tp_size <= 0
+                or cfg.attn_dp_size <= 0
+                or resolved.attn_cp_size <= 0
+                or cfg.tp_size % divisor
+            ):
+                raise ValueError(
+                    "Invalid attention topology: "
+                    f"tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
+                    f"attn_cp_size={resolved.attn_cp_size}."
+                )
+            attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=resolved.attn_cp_size,
+                attn_dp_size=cfg.attn_dp_size,
+            )
+            attn_replica_size = attn_tp_size * resolved.attn_cp_size
+            physical_ep_size_to_dp_size(cfg.max_ep_size, attn_replica_size)
+            physical_ep_size_to_dp_size(
+                cfg.elastic_ep_initial_size or cfg.tp_size, attn_replica_size
+            )
+            if cfg.ep_join_mode == "scale":
+                physical_ep_size_to_dp_size(cfg.ep_join_rank_offset, attn_replica_size)
+        except ValueError as exc:
+            raise AssertionError(str(exc)) from exc
+
+        if attn_tp_size > 1:
+            assert cfg.moe_dense_tp_size == 1, (
+                "Elastic EP scale-up with attention TP greater than one requires "
+                "--moe-dense-tp-size 1 "
+                f"(got moe_dense_tp_size={cfg.moe_dense_tp_size})."
+            )
+
         assert cfg.elastic_ep_scale_timeout > 0, (
             "--elastic-ep-scale-timeout must be greater than zero."
         )
@@ -618,6 +684,11 @@ def handle_elastic_ep(server_args: Any):
             "Elastic EP scale-up requires --pp-size 1 "
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
+        assert attn_tp_size % cfg.dcp_size == 0, (
+            "Elastic EP scale-up requires --dcp-size to divide the fixed "
+            "attention TP width "
+            f"(got dcp_size={cfg.dcp_size}, attn_tp_size={attn_tp_size})."
+        )
 
         decode_backend = cfg.cuda_graph_config.decode.backend
         assert decode_backend in (Backend.DISABLED, Backend.FULL), (
@@ -669,12 +740,8 @@ def handle_elastic_ep(server_args: Any):
         )
         assert resolved.ep_size == cfg.tp_size, (
             "Elastic EP scale-up requires ep_size == tp_size "
-            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
-            "and the attention DP group must all coincide with WORLD."
-        )
-        assert cfg.attn_dp_size == cfg.tp_size, (
-            "Elastic EP scale-up requires attn_dp_size == tp_size "
-            f"(got attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size})."
+            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); "
+            "physical EP membership must coincide with the launch-time TP span."
         )
         assert resolved.moe_a2a_backend == "nixl", (
             "Elastic EP scale-up requires --moe-a2a-backend nixl "
@@ -686,8 +753,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
         raise ValueError(
-            "--ep-static-dispatch-policy must be one of "
-            "'nearest' or 'locality_fair'."
+            "--ep-static-dispatch-policy must be one of 'nearest' or 'locality_fair'."
         )
 
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
@@ -730,6 +796,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
         "static",
         "lp",
+        "load_aware",
     ):
         raise ValueError(
             f"--ep-dispatch-algorithm {cfg.ep_dispatch_algorithm} picks a "
@@ -738,6 +805,18 @@ def handle_eplb_and_dispatch(server_args: Any):
             "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
         )
 
+    if cfg.ep_dispatch_algorithm == "load_aware":
+        if not get_platform().is_hip:
+            raise ValueError(
+                "--ep-dispatch-algorithm load_aware is currently supported "
+                "only on ROCm."
+            )
+        if cfg.ep_num_redundant_experts <= 0:
+            raise ValueError(
+                "--ep-dispatch-algorithm load_aware requires "
+                "--ep-num-redundant-experts > 0."
+            )
+
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":
         assert resolved_view(server_args).ep_size > 1
 
@@ -745,9 +824,7 @@ def handle_eplb_and_dispatch(server_args: Any):
 def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     platform = get_platform()
-    is_protected_platform = (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    )
+    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
     if not is_protected_platform:
         if (
             cfg.enable_prefill_context_parallel

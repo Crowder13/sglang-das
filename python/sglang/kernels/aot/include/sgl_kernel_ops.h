@@ -169,6 +169,14 @@ void rotary_embedding(
     torch::Tensor& cos_sin_cache,
     bool is_neox);
 
+void minimax_h3_rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
@@ -206,25 +214,8 @@ void deepseek_v4_topk_transform_512(
 #endif
 
 /*
- * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ * From csrc/elementwise (DeepSeek-V4 indexer rope + hadamard quant)
  */
-void dsv4_fused_q_norm_rope(
-    const at::Tensor& q_input,
-    at::Tensor& q_output,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    double eps);
-
-void dsv4_fused_k_norm_rope_flashmla(
-    const at::Tensor& kv,
-    const at::Tensor& kv_weight,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    const at::Tensor& out_loc,
-    at::Tensor& kvcache,
-    double eps,
-    int64_t page_size);
-
 void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& q_input,
     at::Tensor& q_fp8,
@@ -347,25 +338,8 @@ void apply_shuffle_mul_sum(
     const std::optional<torch::Tensor>& factors);
 
 /*
- * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ * From csrc/elementwise (DeepSeek-V4 indexer rope + hadamard quant)
  */
-void dsv4_fused_q_norm_rope(
-    const at::Tensor& q_input,
-    at::Tensor& q_output,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    double eps);
-
-void dsv4_fused_k_norm_rope_flashmla(
-    const at::Tensor& kv,
-    const at::Tensor& kv_weight,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    const at::Tensor& out_loc,
-    at::Tensor& kvcache,
-    double eps,
-    int64_t page_size);
-
 void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& q_input,
     at::Tensor& q_fp8,

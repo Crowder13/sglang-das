@@ -52,6 +52,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
@@ -102,7 +103,10 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=planner,
         )
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
+        ):
             metadata = [
                 PagedIndexerMetadata(
                     page_size=256,
@@ -285,7 +289,9 @@ class TestDSV4TopKDispatch(CustomTestCase):
             backend.forward_c4_indexer(
                 x=torch.empty((1, 1)),
                 q_lora=torch.empty((1, 1)),
-                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                c4_indexer=SimpleNamespace(
+                    use_fp4_indexer=False, use_direct_int8_indexer_q=False, layer_id=0
+                ),
                 forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
             )
 
@@ -567,7 +573,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         expected = MagicMock(name="logits")
         deep_gemm = SimpleNamespace(fp8_mqa_logits=MagicMock(return_value=expected))
 
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
+        ):
             kv = C4IndexerBackendMixin._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
@@ -788,6 +797,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         )
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_METADATA}._is_hcu", False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
             patch(f"{_METADATA}.is_hip", return_value=False),
@@ -902,6 +912,61 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
         for rows_per_chunk in (1, 7, 16, rows - 1):
             with self.subTest(rows_per_chunk=rows_per_chunk):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
+
+
+class TestDeepSelectFullTopKDecode(CustomTestCase):
+    @staticmethod
+    def _decode_case():
+        from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+
+        scores = torch.tensor(
+            [[1.0, 4.0, 2.0, 3.0], [3.0, 2.0, -torch.inf, -torch.inf]],
+            dtype=torch.float32,
+        )
+        lens = torch.tensor([4, 2], dtype=torch.int64)
+        slots = torch.tensor([[40, 10, 30, 20], [80, 70, 0, 0]], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[10], [20]], dtype=torch.int32),
+            compressed_page_size=4,
+        )
+        page_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        inputs = DecodeInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(2),
+            paged_metadata=metadata,
+            is_verify=False,
+            out_page_indices=page_indices,
+        )
+        data = DecodeScores(bs=2, lmax=4, lens=lens, slots=slots, scores=scores)
+        return inputs, data
+
+    def test_decode_uses_select_decode_fallback(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        inputs, data = self._decode_case()
+        inputs.indexer.index_topk = 2
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = False
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "topk_page_transform") as page_transform,
+            patch.object(mod, "select_decode") as select_decode,
+        ):
+            indexer.topk_decode(inputs)
+
+        page_transform.assert_not_called()
+        select_decode.assert_called_once_with(inputs, data, 2)
 
 
 class TestChunkedPagedDecode(CustomTestCase):

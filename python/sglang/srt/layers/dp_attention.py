@@ -29,10 +29,16 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_attn_dp_tp_group,
+    get_attn_cp_overlap_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+)
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -104,16 +110,20 @@ def dp_slot_in(per_rank) -> int:
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
-    After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank. Inside a draft scope that owns its attention,
-    it is still the slot in the target's gather (see patch_tensor_parallel_group).
+    After elastic scale-up, convert the physical EP rank (the TP rank plus the
+    join offset) to its logical attention-DP replica; otherwise use the local
+    attention-DP rank. Inside a draft scope that owns its attention, it is still
+    the slot in the target's gather (see patch_tensor_parallel_group).
     """
     scoped = get_flags().dp.scoped_gather_slot
     if scoped is not None:
         return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.tp_rank + parallel.ep_join_rank_offset
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset,
+            attn_replica_size(),
+        )
     return parallel.attn_dp_rank
 
 
@@ -395,7 +405,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    dp_rank = dp_slot_in(global_num_tokens)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
@@ -580,8 +590,11 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
+
     if forward_batch.dp_local_start_pos is None:
-        dp_rank = dp_slot_in(forward_batch.global_num_tokens_gpu)
+        dp_rank = getattr(forward_batch, "dp_local_token_index", None)
+        if dp_rank is None:
+            dp_rank = dp_slot_in(forward_batch.global_num_tokens_gpu)
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
@@ -603,7 +616,9 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = dp_slot_in(global_num_tokens)
+    dp_rank = getattr(forward_batch, "dp_local_token_index", None)
+    if dp_rank is None:
+        dp_rank = dp_slot_in(global_num_tokens)
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch
@@ -676,7 +691,9 @@ def _dp_gather_via_all_reduce(
     # CP ranks hold the same rows of their DP group, and CP rank 0 writes them,
     # unless they pass the counts of their shards; then each writes its own.
     writes = (is_partial or get_parallel().attn_tp_rank == 0) and (
-        cp_shard_counts is not None or get_parallel().attn_cp_rank == 0
+        cp_shard_counts is not None
+        or getattr(forward_batch, "cp_local_dp_layout", False)
+        or get_parallel().attn_cp_rank == 0
     )
 
     if local_tokens.shape[0] > 0 and writes:
@@ -699,6 +716,8 @@ def _dp_gather_via_all_reduce(
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
         )
+    elif getattr(forward_batch, "cp_local_dp_layout", False):
+        global_tokens[:] = get_attn_dp_tp_group().all_reduce(global_tokens)
     else:
         NUM_GPUS_PER_NODE = 8
         if (
@@ -837,10 +856,9 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     outputs are then discarded by the post-reorder scatter — pure wasted
     compute, and a masked-grouped-GEMM workspace blow-up when they collide
     on the same top-k.  -1 is the drop sentinel both the triton fused_moe
-    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
-    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
-    the mapping table's last entry).  Capture-safe: per-batch state is read
-    only from the replay-updated global_num_tokens_gpu tensor.
+    (filter_expert) and the DeepGEMM EP preprocess honor.  Capture-safe:
+    per-batch state is read only from the replay-updated
+    global_num_tokens_gpu tensor.
     """
     counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
@@ -1030,9 +1048,14 @@ def _dp_gather(
         forward_batch.dp_padding_mode is not None
         and forward_batch.dp_padding_mode.is_max_len()
     ):
-        _dp_gather_via_all_gather(
-            global_tokens, local_tokens, forward_batch, is_partial
-        )
+        if get_parallel().attn_cp_size > 1:
+            _dp_gather_via_all_reduce(
+                global_tokens, local_tokens, forward_batch, is_partial
+            )
+        else:
+            _dp_gather_via_all_gather(
+                global_tokens, local_tokens, forward_batch, is_partial
+            )
     else:
         _dp_gather_via_all_reduce(
             global_tokens, local_tokens, forward_batch, is_partial
@@ -1156,14 +1179,13 @@ def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> b
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     _note_dp_gather_in_prefill_graph()
-    parallel = get_parallel()
-    if parallel.attn_cp_size > 1 and input.shape[0] % parallel.tp_size:
-        # MAX_LEN padding aligns each DP slot to attention TP, not CP x TP.
-        # Small decode batches cannot be equally split over the full TP group.
-        reduced = parallel.tp_group.all_reduce(input)
-        output.copy_(
-            reduced.narrow(0, parallel.attn_dp_rank * output.shape[0], output.shape[0])
-        )
+    if get_parallel().attn_cp_size > 1:
+        # MAX_LEN has one equal-sized slot per attention DP.  Combine the TP
+        # partials and return the current DP slot to every non-sharded CP copy.
+        input = tensor_model_parallel_all_reduce(input)
+        local_rows = output.shape[0]
+        local_start = get_attention_dp_rank() * local_rows
+        output.copy_(input.narrow(0, local_start, local_rows))
         return
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
@@ -1182,23 +1204,9 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_parallel().tp_rank
         ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
-        if parallel.attn_cp_size > 1:
-            # TP reduce-scatter splits each DP slot over CP x attention TP.
-            # Restore both axes: decode (and warmup) holds the full DP slot on
-            # every CP rank, even though prefill uses context-sharded rows.
-            cp_local_tokens = scattered_local_tokens
-            if parallel.attn_tp_size > 1:
-                cp_local_tokens = output.new_empty(
-                    (output.shape[0] // parallel.attn_cp_size, *output.shape[1:])
-                )
-                parallel.attn_tp_group.all_gather_into_tensor(
-                    cp_local_tokens, scattered_local_tokens
-                )
-            parallel.attn_cp_group.all_gather_into_tensor(output, cp_local_tokens)
-        else:
-            parallel.attn_tp_group.all_gather_into_tensor(
-                output, scattered_local_tokens
-            )
+        get_parallel().attn_tp_group.all_gather_into_tensor(
+            output, scattered_local_tokens
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1311,28 @@ def dp_reduce_scatterv_async(
     return ev
 
 
+def dp_reduce_scatter_tensor_async(
+    output_local: torch.Tensor,
+    global_tokens: torch.Tensor,
+    event_key=("combine_tensor", 0),
+) -> torch.cuda.Event:
+    """Launch the regular DP reduce-scatter combine on the TBO comm stream.
+
+    Unlike ``dp_reduce_scatterv_async``, this supports the MAX_LEN CUDA-graph
+    layout and hybrid attention-TP layouts.  In the latter case
+    ``dp_reduce_scatter_tensor`` performs the TP reduce-scatter followed by the
+    attention-TP all-gather needed to reconstruct TP_ATTN_FULL.
+    """
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)
+        dp_reduce_scatter_tensor(output_local, global_tokens)
+        ev.record(comm)
+    return ev
+
+
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
 
@@ -1321,6 +1351,7 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+
 
 def attn_cp_all_to_all_single(
     output: torch.Tensor,

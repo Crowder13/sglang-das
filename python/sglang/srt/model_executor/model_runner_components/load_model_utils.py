@@ -16,7 +16,12 @@ from sglang.srt.arg_groups.overrides import (
     modelexpress_url_of,
 )
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadFormat,
+    LoadGroup,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -130,10 +135,39 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
                     model.__class__,
                 )
         else:
-            logger.warning(
-                "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0."
-            )
+            embedded = []
+            candidates = []
+            for module in model.modules():
+                if not hasattr(module, "k_scale_float") or not hasattr(
+                    module, "v_scale_float"
+                ):
+                    continue
+                candidates.append(module)
+                k_scale = getattr(module, "k_scale_float", None)
+                v_scale = getattr(module, "v_scale_float", None)
+                if k_scale is not None and v_scale is not None:
+                    embedded.append((float(k_scale), float(v_scale)))
+            if embedded:
+                if len(embedded) != len(candidates):
+                    raise RuntimeError(
+                        "FP8 KV checkpoint loaded embedded scales for only "
+                        f"{len(embedded)}/{len(candidates)} attention layers."
+                    )
+                values = [value for pair in embedded for value in pair]
+                logger.info(
+                    "Using embedded per-layer FP8 KV cache scales for %d "
+                    "attention layers (range %.9g..%.9g); implicit scale=1.0 "
+                    "fallback is not active.",
+                    len(embedded),
+                    min(values),
+                    max(values),
+                )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0. "
+                    "This may lead to less accurate results!"
+                )
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
@@ -202,6 +236,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -231,6 +266,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        load_group=load_group,
     )
 
 

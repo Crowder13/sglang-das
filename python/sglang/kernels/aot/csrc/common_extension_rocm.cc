@@ -97,15 +97,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
 
   m.def(
-      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
-  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
-
-  m.def(
-      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
-      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
-  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
-
-  m.def(
       "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
       "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
   m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
@@ -191,6 +182,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
       "correction_bias) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
+
+#ifdef SGLANG_HCU_AOT_FP8_QUANT
+  // HCU builds include the e4m3fn AOT implementation. Other ROCm builds keep
+  // using the existing runtime fallback instead of exporting a mismatched op.
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+#endif
 
   /*
    * From csrc/speculative
@@ -335,6 +333,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
+  m.def(
+      "minimax_h3_rotary_embedding(Tensor positions, Tensor! query,"
+      "                            Tensor!? key, int head_size,"
+      "                            Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("minimax_h3_rotary_embedding", torch::kCUDA, &minimax_h3_rotary_embedding);
 
   /*
    * From csrc/memory

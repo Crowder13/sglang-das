@@ -26,6 +26,7 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cleanup import run_cleanup_step
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -59,6 +60,22 @@ class RetractionBackup(NamedTuple):
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
+
+
+def suffix_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    seq_len: int,
+    page_size: int,
+) -> np.ndarray:
+    """Pages of a request's tokens [prefix_len, seq_len).
+
+    PD prefill and decode both call this with the same page-aligned prefix
+    (decode_prefix_len), so their lists pair up page by page even though their
+    rows point at different physical pages.
+    """
+    return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):
@@ -107,11 +124,12 @@ def free_swa_out_of_window_slots(
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
-        # frontier, and subtracting at least one page keeps it below the insert
-        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
-        # No extra page margin is needed.
-        evict_threshold = pre_len - max(sliding_window_size, page_size)
+        # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
+        # a key that ends at page_floor(pre_len) still has a full window of live SWA,
+        # and the last leaf, below page_floor(seq_len), is never all-tombstone.
+        evict_threshold = pre_len - ceil_align(
+            max(sliding_window_size, page_size), page_size
+        )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained
@@ -192,9 +210,9 @@ def _req_radix_key(
     token_ids: array[int],
     max_prefix_len: Optional[int] = None,
 ) -> RadixKey:
-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
+    # bounded replay); cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
     if max_prefix_len is not None:
         key_limit = (
@@ -230,7 +248,8 @@ def match_kv_cache(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            return_full_match=return_full_match or bool(tree_cache.swa_reprefill_tail_tokens()),
+            return_full_match=return_full_match
+            or bool(tree_cache.swa_reprefill_tail_tokens()),
             cow_mamba=cow_mamba,
             req=req,
         )
@@ -314,17 +333,14 @@ def _evict_until_allocatable(
             return
 
 
-def dsv41_dspark_needs_rebootstrap(
+def dsv4_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
-    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
-        return False
-
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     pool = token_to_kv_pool_allocator.get_kvcache()
-    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
+    return isinstance(pool, DeepSeekV4TokenToKVPool)
 
 
 def backup_kv_cache(
@@ -334,15 +350,18 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when no backup can be taken ('none' backend, or the host
-    pool cannot hold it); the caller aborts the request."""
-    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
-        # Drain the in-flight verify before its slots can receive recomputed KV.
+    """Returns False when the request can be neither backed up nor recomputed;
+    the caller aborts it."""
+    if backend == "none":
+        return False
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+        if req.multimodal_inputs is not None:
+            # The recompute payload carries token ids only; images would be lost.
+            return False
+        # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
-    if backend == "none":
-        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -396,6 +415,8 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if getattr(req, "external_kv_abort_requested", False):
+        return _release_aborted_kv_cache(req, tree_cache, checkpoint=checkpoint)
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -438,6 +459,61 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     _release_donated_swa_slots(req, tree_cache)
     tree_cache.req_to_token_pool.free(req)
+    req.kv.mark_kv_released()
+
+
+def _release_aborted_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool
+):
+    """Resume abort cleanup using main's ownership API, never repeat opaque frees."""
+
+    def snapshot():
+        if not req.kv.holds_kv:
+            return None
+        return (req.owned_kv_len(), req.kv.kv_allocated_len, req.kv.cache_protected_len)
+
+    layout = run_cleanup_step(req, "kv.layout", snapshot)
+    if layout is None:
+        if req.kv.holds_mamba:
+            run_cleanup_step(
+                req,
+                "kv.early_mamba",
+                lambda: tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.kv.mamba_pool_idx.unsqueeze(-1)
+                ),
+            )
+            req.kv.mamba_pool_idx = None
+        return
+    owned, allocated, protected = layout
+    if run_cleanup_step(req, "kv.claim", lambda: tree_cache.claim_kv_row(req)):
+        return
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if checkpoint:
+        req.refresh_fill_ids()
+        run_cleanup_step(
+            req, "kv.checkpoint", lambda: tree_cache.checkpoint(req, up_to=owned)
+        )
+    run_cleanup_step(
+        req, "kv.row", lambda: tree_cache.free_kv_row(req.kv, [(protected, owned)])
+    )
+    run_cleanup_step(req, "kv.unlock", lambda: tree_cache.unlock(req.lock))
+    req.lock = None
+    run_cleanup_step(
+        req,
+        "kv.overallocated",
+        lambda: _release_overallocated_kv_indices(req, owned, allocated, tree_cache),
+    )
+    run_cleanup_step(
+        req,
+        "kv.on_release",
+        lambda: tree_cache.on_release(req, checkpointed=checkpoint),
+    )
+    run_cleanup_step(
+        req, "kv.donated_swa", lambda: _release_donated_swa_slots(req, tree_cache)
+    )
+    run_cleanup_step(
+        req, "kv.request_slot", lambda: tree_cache.req_to_token_pool.free(req)
+    )
     req.kv.mark_kv_released()
 
 

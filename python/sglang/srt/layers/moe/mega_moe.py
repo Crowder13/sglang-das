@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_disagg, get_exec
 from sglang.srt.utils import is_hcu, is_hip, is_sm100_supported
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -281,8 +282,12 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts) -> str:
     if _is_hcu:
         # HCU W4A8 experts predate upstream per-layer NVFP4/W4A4 flags.
-        return "nvfp4xnvfp4" if getattr(experts, "_mega_moe_nvfp4", False) else (
-            "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+        return (
+            "nvfp4xnvfp4"
+            if getattr(experts, "_mega_moe_nvfp4", False)
+            else (
+                "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+            )
         )
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
@@ -328,14 +333,19 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+    # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
+    # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
+    # from token TMA loads, so intermediate % 128 suffices, including V4.1
+    # Flash's 2304-wide intermediate dimension.
+    # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    hidden_align = 16 * scale_group
+    if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
-            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
+            f"of {hidden_align} and moe_intermediate_size to be a multiple of "
+            f"{align}; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -362,6 +372,14 @@ def _get_mega_moe_symm_buffer(
         factory = megamoe.get_symm_buffer_for_mega_moe
         # The standalone runtime does not launch through deep_gemm, so the grid
         # budget below neither applies to it nor belongs in its key.
+        num_sms_ctx = nullcontext()
+        get_num_sms = None
+    elif _is_hcu:
+        import deepgemm.mega
+
+        package_key = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+        factory = deepgemm.mega.get_symm_buffer_for_mega_moe
+        cuda_graph_max_tokens_per_rank = None
         num_sms_ctx = nullcontext()
         get_num_sms = None
     else:
@@ -451,7 +469,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if get_is_capture_mode():
         if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
             raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
-        return not _is_hcu or _is_standalone_megamoe_runtime()
+        # deepgemm.mega supports capture with the graph's static padded rows;
+        # topk masks the non-token rows. Keep the same prepared weights/runtime
+        # during capture rather than falling back to the generic MoE runner.
+        return True
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -459,6 +480,13 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if _is_hcu and max_tokens_per_rank > cap:
+        # Prepared Mega weights cannot be consumed by the generic fallback.
+        raise ValueError(
+            f"HCU MegaMoE needs {max_tokens_per_rank} tokens per rank, exceeds cap {cap}; "
+            "raise SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK "
+            "or shrink the prefill batch"
+        )
     return max_tokens_per_rank <= cap
 
 
@@ -471,7 +499,8 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
-        and moe.shared_experts_weight_block_size == [128, 128]
+        and moe.shared_experts_weight_block_size is not None
+        and moe.shared_experts_weight_block_size[1] % 32 == 0
     )
 
 
@@ -522,7 +551,8 @@ def forward_mega_moe(
         overlap_stream.wait_stream(current_stream)
         if eager_w4a8_overlap:
             for tensor in (
-                hidden_states, input_ids_global,
+                hidden_states,
+                input_ids_global,
                 getattr(forward_batch, "num_token_non_padded", None),
             ):
                 if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
@@ -573,19 +603,31 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if (
+            not moe.is_hash
+            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+        ):
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        else:
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -608,7 +650,13 @@ def _run_mega_routed(
         activation_clamp=activation_clamp,
         routed_scaling_factor=(
             1.0
-            if moe.experts.should_fuse_routed_scaling_factor_in_topk
+            if (
+                getattr(
+                    moe.topk, "topk_config", moe.topk
+                ).apply_routed_scaling_factor_on_output
+                if _is_hcu
+                else moe.experts.should_fuse_routed_scaling_factor_in_topk
+            )
             else float(moe.routed_scaling_factor)
         ),
         num_shared_experts=(
@@ -692,9 +740,7 @@ def run_mega_routed_experts(
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
         quant_mode=(
-            "w4a8"
-            if getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
-            else "fp8"
+            "w4a8" if getattr(experts, "_mega_moe_hcu_w4a8_weights", False) else "fp8"
         ),
     )
 
@@ -860,30 +906,34 @@ def _run_deep_gemm_hcu_w8a8_mega_moe(
     dispatch_num_tokens: int,
     activation_clamp: Optional[float] = None,
 ) -> torch.Tensor:
-    import deep_gemm
+    import deepgemm.mega
 
     if num_tokens > 0:
-        x_fp8, x_scale = deep_gemm.cast_to_fp8_channelwise(hidden_states)
-        buf.x[:num_tokens].copy_(x_fp8)
-        buf.x_sf[:num_tokens].copy_(x_scale)
-        buf.topk_idx[:num_tokens].copy_(topk_ids.to(buf.topk_idx.dtype))
-        buf.topk_weights[:num_tokens].copy_(topk_weights.to(buf.topk_weights.dtype))
+        deepgemm.mega.mega_moe_preprocess(
+            hidden_states.to(torch.bfloat16).contiguous(),
+            topk_ids.contiguous(),
+            topk_weights.contiguous(),
+            buf,
+            num_tokens,
+        )
 
     y = torch.empty(
         (num_tokens, hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_w8a8_mega_moe(
+    # Empty ranks must still participate in the peer-memory barriers. The
+    # operator reads this rank's actual token count from y, with buf providing
+    # the shared capacity; it does not accept dispatch_num_tokens or recipe.
+    deepgemm.mega.fp8_mega_moe(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=activation_clamp,
+        activation_clamp=activation_clamp
+        if activation_clamp is not None
+        else float("inf"),
         fast_math=True,
-        dispatch_num_tokens=dispatch_num_tokens,
     )
     return y
 
@@ -939,9 +989,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
         experts.mega_l2_weights,
         buf,
         cumulative_local_expert_recv_stats=(
-            None
-            if is_graph_capture
-            else getattr(experts, "mega_moe_recv_stats", None)
+            None if is_graph_capture else getattr(experts, "mega_moe_recv_stats", None)
         ),
         activation_clamp=activation_clamp,
         fast_math=True,
@@ -983,31 +1031,49 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
     if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
-        raise ValueError("W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+        raise ValueError(
+            "W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+        )
     if get_exec().moe.enable_eplb:
-        raise ValueError("W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported")
+        raise ValueError(
+            "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
+        )
     if not get_exec().graph.disable_cuda_graph:
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
     for name in ("w13_weight", "w2_weight"):
         weight = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(
-            pack_w4a8_moe_hipc_weight(weight.data), requires_grad=False,
-        ))
+        setattr(
+            experts,
+            name,
+            torch.nn.Parameter(
+                pack_w4a8_moe_hipc_weight(weight.data),
+                requires_grad=False,
+            ),
+        )
     for name in ("w13_weight_scale", "w2_weight_scale"):
         scale = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False))
+        setattr(
+            experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False)
+        )
     experts.mega_l1_weights = (experts.w13_weight, experts.w13_weight_scale)
     experts.mega_l2_weights = (experts.w2_weight, experts.w2_weight_scale)
     metadata = get_global_expert_location_metadata()
     if metadata is not None:
         logical_experts = metadata.num_logical_experts
         if logical_experts % 8:
-            raise ValueError("W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8")
+            raise ValueError(
+                "W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8"
+            )
         groups = (
-            metadata.physical_to_logical_map[experts.layer_id] // (logical_experts // 8)
-        ).to(torch.int32).contiguous()
+            (
+                metadata.physical_to_logical_map[experts.layer_id]
+                // (logical_experts // 8)
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
         physical_groups = torch.arange(
             groups.numel(), device=groups.device, dtype=torch.int32
         ) // (groups.numel() // 8)
@@ -1127,6 +1193,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
         experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
         experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+        # EPLB moves each expert's slice of every parameter, so the UTCCP copies
+        # move with the scales they are transposed from.
+        experts.register_parameter(
+            "mega_w13_weight_scale_utccp",
+            torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+        )
+        experts.register_parameter(
+            "mega_w2_weight_scale_utccp",
+            torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+        )
     else:
         l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
 
@@ -1191,21 +1267,21 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
     )
 
     if runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
-        if l1_rows % 16 != 0 or hidden % 16 != 0 or intermediate % 16 != 0:
+        if l1_rows % 16 != 0 or hidden % 64 != 0 or intermediate % 64 != 0:
             raise ValueError(
-                "deep_gemm HCU W8A8 MegaMoE requires rows and K divisible by 16"
+                "deep_gemm HCU W8A8 MegaMoE requires rows divisible by 16 "
+                "and K divisible by 64"
             )
-        import deep_gemm
+        import deepgemm.mega
 
-        experts.mega_l1_weights = (
-            deep_gemm.weight8bit_nt_kpack2_marlin(w13.contiguous()),
-            w13_scale,
+        # Interleave both L1 gate/up weights and their channel scales before
+        # Marlin w6 packing, exactly as in the operator team's FP8 demo.
+        experts.mega_l1_weights, experts.mega_l2_weights = (
+            deepgemm.mega.transform_weights_for_mega_moe(
+                (w13, w13_scale), (w2, w2_scale)
+            )
         )
-        experts.mega_l2_weights = (
-            deep_gemm.weight8bit_nt_kpack2_marlin(w2.contiguous()),
-            w2_scale,
-        )
-        experts._mega_moe_hcu_weight_layout = "marlin_kpack2"
+        experts._mega_moe_hcu_weight_layout = "marlin_w6_interleaved"
     else:
         if (num_experts, hidden, intermediate) != (32, 4096, 2048):
             raise ValueError(
@@ -1254,6 +1330,8 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
     experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w8a8_weights = True
     experts._mega_moe_weights_built = True
+
+
 def build_mega_moe_shared_weights(
     shared_experts,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
@@ -1278,10 +1356,21 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
     if sf.dtype == torch.int32:
         # Requantized for the DeepGEMM linear runner.
         sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+        block_m, block_k = 128, 128
+    else:
+        block_m, block_k = linear.quant_method.quant_config.weight_block_size
+    sf = sf.repeat_interleave(block_k // 32, dim=-1)
+    if block_m == 128:
+        return transform_sf_into_required_layout(
+            sf, mn=n, k=k, recipe=(128, 32), disable_ue8m0_cast=False
+        )
+    if block_m != 1:
+        sf = sf.repeat_interleave(block_m, dim=0)
     return transform_sf_into_required_layout(
-        sf.repeat_interleave(4, dim=-1),
+        sf.unsqueeze(0).contiguous(),
         mn=n,
         k=k,
-        recipe=(128, 32),
+        recipe=(1, 32),
+        num_groups=1,
         disable_ue8m0_cast=False,
-    )
+    ).squeeze(0)

@@ -757,7 +757,7 @@ class TopK(BaseFusedOp):
                 )
             if self.enable_waterfill:
                 raise ValueError(
-                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with " "waterfill"
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with waterfill"
                 )
 
         self.waterfill_balancer = None
@@ -1900,7 +1900,7 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
-def _eplb_remap_enabled() -> bool:
+def is_expert_remapping_enabled() -> bool:
     # A real logical->physical mapping only exists when EPLB is enabled, the
     # initial expert placement is non-trivial, or there are redundant physical
     # experts. Otherwise the map is identity and the remap must be skipped (it is
@@ -2677,20 +2677,25 @@ def _post_process_topk_ids(
     )
     hip_deepep_postprocessed = False
     _fold_pad_weights_into_append = False
+    log2phy_prob = None
+    dispatch_algorithm = (
+        getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+        if expert_location_dispatch_info is not None
+        else None
+    )
+    if dispatch_algorithm in ("lp", "load_aware"):
+        from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+        lplb_solver = get_global_lplb_solver(layer_id)
+        if lplb_solver is not None:
+            log2phy_prob = (
+                lplb_solver.solve(topk_ids, num_token_non_padded)
+                if dispatch_algorithm == "load_aware"
+                else lplb_solver.solve(topk_ids)
+            )
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
-        log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
-        ):
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
-
         if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
@@ -2727,8 +2732,10 @@ def _post_process_topk_ids(
         # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        eplb_remap_enabled = _eplb_remap_enabled()
-        remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        eplb_remap_enabled = is_expert_remapping_enabled()
+        remap_info = (
+            expert_location_dispatch_info if is_expert_remapping_enabled() else None
+        )
         if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
             # DeepEP disables shared-expert fusion by default. On that main HCU
             # path no later operation can introduce another route, so remap and
@@ -2737,7 +2744,10 @@ def _post_process_topk_ids(
             # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
-            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+            if remap_info is not None and remap_info.ep_dispatch_algorithm in (
+                "lp",
+                "load_aware",
+            ):
                 # LP dispatch uses a separate HIP kernel. Resolve probabilities
                 # before entering the compiled padding/dtype postprocess.
                 from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
@@ -2745,7 +2755,7 @@ def _post_process_topk_ids(
                 solver = get_global_lplb_solver(layer_id)
                 if solver is None:
                     raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
-                probabilities = solver.solve(topk_ids)
+                probabilities = log2phy_prob
                 if hasattr(solver, "static_dispatch_map"):
                     from sglang.kernels.ops.lplb import cuda_solver
 
@@ -2766,7 +2776,7 @@ def _post_process_topk_ids(
             hip_deepep_postprocessed = True
         else:
             # Let append kernels materialize padded ids when remapping is disabled.
-            eplb_remap_enabled = _eplb_remap_enabled()
+            eplb_remap_enabled = is_expert_remapping_enabled()
             _fold_pad_into_append = (
                 _aiter_append
                 and not eplb_remap_enabled
@@ -2803,8 +2813,12 @@ def _post_process_topk_ids(
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if remap_info is not None and not hip_deepep_postprocessed and not recorder_was_fused:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
+        if (
+            remap_info is not None
+            and not hip_deepep_postprocessed
+            and not recorder_was_fused
+        ):
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -2908,7 +2922,12 @@ def _post_process_topk_ids(
         # Apply this after shared-expert remapping so every padded route,
         # including appended shared slots, is omitted by DeepEP dispatch.
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
-    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
+    elif (
+        _is_hip
+        and not skip_deepep_padded_tokens
+        and not _skip_hip_pad_mask
+        and not _fold_pad_weights_into_append
+    ):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2990,7 +3009,7 @@ def select_experts(
         and (
             num_fused_shared_experts == 0
             or has_per_rank_fused_shared_slots(num_fused_shared_experts)
-            or not _eplb_remap_enabled()
+            or not is_expert_remapping_enabled()
         )
     ):
         # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits

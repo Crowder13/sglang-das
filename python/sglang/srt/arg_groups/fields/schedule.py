@@ -168,7 +168,9 @@ class Schedule(msgspec.Struct):
                 "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
                 "family), how many radix-cached prefix tails it keeps room for. "
                 "Each tail is one sliding window plus one page. Default: 4 x "
-                "max_running_requests per attention-DP rank, 0 when the radix "
+                "max_running_requests per attention-DP rank, multiplied by "
+                "num_layers // draft_layers under encoder SWA bounded replay with "
+                "DSpark (only draft layers are paged there); 0 when the radix "
                 "cache is disabled."
             ),
         ),
@@ -277,3 +279,44 @@ class Schedule(msgspec.Struct):
             "pipeline parallelism."
         ),
     ] = None
+
+    enable_prefill_idle_coalescing: A[
+        bool,
+        (
+            "When the engine is idle, briefly delay its first prefill batch so "
+            "concurrently arriving requests can join it. Queue growth resets a "
+            "short settle window, allowing natural BS2/4/8/16/32 formation. "
+            "Does not affect refill scheduling while a batch is running. "
+            "Disabled by default."
+        ),
+    ] = False
+    prefill_idle_coalesce_max_delay_ms: A[
+        float,
+        (
+            "Maximum wall-clock delay in milliseconds for idle first-request "
+            "coalescing. Once reached, the single request is released."
+        ),
+    ] = 50.0
+    prefill_idle_coalesce_settle_ms: A[
+        float,
+        (
+            "Queue quiet time in milliseconds before releasing an idle batch "
+            "containing at least two requests. Queue growth resets this timer."
+        ),
+    ] = 10.0
+    prefill_idle_coalesce_burst_max_delay_ms: A[
+        float,
+        (
+            "Maximum total idle coalescing delay in milliseconds after a "
+            "second request has formed a burst. This is separate from the "
+            "smaller single-request delay bound."
+        ),
+    ] = 500.0
+    prefill_idle_coalesce_max_batch_size: A[
+        int,
+        (
+            "Maximum request count collected by idle prefill coalescing. The "
+            "batch is released immediately at this size; ordinary scheduler "
+            "token and KV capacity checks still apply."
+        ),
+    ] = 32

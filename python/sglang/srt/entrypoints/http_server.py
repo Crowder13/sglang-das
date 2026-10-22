@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Annotated,
@@ -66,6 +67,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.configs.model_config import load_joint_head_config
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -168,18 +170,21 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
+    fastapi_telemetry_disabled_kwargs,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
     build_server_info,
     delete_directory,
+    freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
@@ -189,6 +194,7 @@ from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
+    model_json_response,
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -291,8 +297,9 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        warmup_thread_kwargs = dict(server_args=server_args)
-        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+        worker_id = _global_state.tokenizer_manager.worker_id
+        warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
+        thread_label = f"MultiTokenizer-{worker_id}"
 
     # Add prometheus middleware
     if get_observability().enable_metrics:
@@ -503,6 +510,7 @@ class ORJSONRoute(APIRoute):
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+    **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
 app.add_middleware(
@@ -758,43 +766,99 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
+    tokenizer_manager = _global_state.tokenizer_manager
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide and crash the shared DetokenizerManager decode_status).
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
-
-    if _global_state.tokenizer_manager.is_generation:
+    health_dp_size = (
+        tokenizer_manager.elastic_worker_count
+        if get_parallel().attn_dp_enabled
+        else 1
+    )
+    health_requests = []
+    if tokenizer_manager.is_generation and health_dp_size > 1:
+        # One native batch is a single scheduler message, so every explicitly
+        # routed DP item is admitted in the same model-collective round.
+        # Independent scalar tasks race at the scheduler boundary: one DP can
+        # enter FlashMLA/MoE while its peer is still idle and deadlock startup.
+        rids = [
+            f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+            for _ in range(health_dp_size)
+        ]
         gri = GenerateReqInput(
-            rid=rid,
-            input_ids=[0],
+            rid=rids,
+            input_ids=[[0] for _ in range(health_dp_size)],
             sampling_params=sampling_params,
             log_metrics=False,
+            routed_dp_rank=list(range(health_dp_size)),
         )
         if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
-            gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = 0
+            gri.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * health_dp_size
+            gri.bootstrap_room = list(range(health_dp_size))
+        health_requests.append(gri)
     else:
-        gri = EmbeddingReqInput(
-            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
-        )
+        for dp_rank in range(health_dp_size):
+            # uuid keeps rids unique across tokenizer workers (a bare time.time()
+            # can collide and crash the shared DetokenizerManager decode_status).
+            rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+            if tokenizer_manager.is_generation:
+                gri = GenerateReqInput(
+                    rid=rid,
+                    input_ids=[0],
+                    sampling_params=sampling_params,
+                    log_metrics=False,
+                    routed_dp_rank=dp_rank if health_dp_size > 1 else None,
+                )
+                if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+                    gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                    gri.bootstrap_room = dp_rank
+            else:
+                gri = EmbeddingReqInput(
+                    rid=rid,
+                    input_ids=[0],
+                    sampling_params=sampling_params,
+                    log_metrics=False,
+                )
+                if health_dp_size > 1:
+                    gri.routed_dp_rank = dp_rank
+            health_requests.append(gri)
 
-    async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
+    async def gen(gri):
+        async for _ in tokenizer_manager.generate_request(gri, request):
             break
 
-    task = asyncio.create_task(gen())
+    tasks = [asyncio.create_task(gen(gri)) for gri in health_requests]
+
+    # Cross-DP model collectives require every attention-DP rank to enter the
+    # same forward.  Wait for the complete fan-out instead of returning after
+    # the first detokenizer heartbeat and cancelling a peer mid-collective.
+    if health_dp_size > 1:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=HEALTH_CHECK_TIMEOUT)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            for gri in health_requests:
+                rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+                for rid in rids:
+                    tokenizer_manager.rid_to_state.pop(rid, None)
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.exception(
+                "DP-attention health check failed for %s ranks", health_dp_size
+            )
+            return Response(status_code=503)
+        tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        if tokenizer_manager.last_receive_tstamp > tic:
+            tasks[0].cancel()
+            tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
+            tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
-    task.cancel()
+    tasks[0].cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -804,8 +868,8 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
+    tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
@@ -890,13 +954,15 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     return msgspec_to_builtins(
-        {
-            **build_server_info(server_args, _global_state.scheduler_info),
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            "frontend": "python",
-        }
+        redact_watermark_secrets(
+            {
+                **build_server_info(server_args, _global_state.scheduler_info),
+                "startup_time": _global_state.tokenizer_manager.startup_time,
+                "internal_states": internal_states,
+                "version": __version__,
+                "frontend": "python",
+            }
+        )
     )
 
 
@@ -1002,6 +1068,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
@@ -1014,12 +1081,19 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
+
+
+def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
+    # Only /v1/systemone builds a decision layout, from the prompt it compiles.
+    if obj.decision_layout is not None:
+        raise ValueError("decision_layout is set only by /v1/systemone")
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -1809,8 +1883,10 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_completion.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -1819,8 +1895,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2143,8 +2221,10 @@ async def sagemaker_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2334,20 +2414,48 @@ def _execute_server_warmup(server_args: ServerArgs):
         and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
     )
+    needs_dp_attention_fanout = (
+        get_parallel().attn_dp_enabled and get_parallel().num_dp_ranks > 1
+    )
     if model_info["is_generation"]:
-        if is_vlm and not get_serving().skip_tokenizer_init:
+        # VLM preprocessing is synchronous in the HTTP event loop.  If the
+        # first VLM request reaches a cross-DP model collective before the
+        # second request finishes preprocessing, startup deadlocks.  Use the
+        # native text endpoint for the model warmup so all DP ranks can be
+        # dispatched concurrently.  Vision inputs still use their normal path
+        # after the server is ready.
+        if (
+            is_vlm
+            and not get_serving().skip_tokenizer_init
+            and not needs_dp_attention_fanout
+        ):
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
     else:
         request_name = "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    # One token is sufficient to execute the full prefill path.  DP-attention
+    # ranks may have different local decode batch shapes, so a multi-token
+    # startup request can enter decode-only collectives with incompatible
+    # tensor sizes.  Keep the generic warmup depth for other topologies.
+    max_new_tokens = (
+        1
+        if model_info["is_generation"] and needs_dp_attention_fanout
+        else 8
+        if model_info["is_generation"]
+        else 1
+    )
     json_data = {
         "sampling_params": {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
     }
+    dp_attention_fanout = needs_dp_attention_fanout and request_name in (
+        "/generate",
+        "/encode",
+        "/v1/chat/completions",
+    )
     if get_serving().skip_tokenizer_init:
         json_data["input_ids"] = [
             [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
@@ -2357,6 +2465,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
+        and not dp_attention_fanout
         and get_disagg().disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
@@ -2403,19 +2512,52 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
+    if (
+        not model_info["is_generation"]
+        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+        and load_joint_head_config(get_model().model_path, get_model().revision)
+        is not None
+    ):
+        # A Clef checkpoint answers /v1/systemone decisions only.
+        request_name = "/v1/systemone"
+        json_data = {
+            "model": "warmup",
+            "state": "The capital city of France is Paris.",
+            "questions": {
+                "warmup": {"type": "noul", "instructions": "Is the state true?"}
+            },
+        }
+
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
-            assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            if dp_attention_fanout:
+                json_data["routed_dp_rank"] = list(range(get_parallel().num_dp_ranks))
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
+                logger.info(
+                    "DP-attention warmup requests completed for all %s DP ranks",
+                    get_parallel().num_dp_ranks,
+                )
+            else:
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
+            # Skip server_status update for Rust server
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2453,6 +2595,19 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
+    return partial(freeze_gc, f"Tokenizer worker {worker_id}", gc_threshold)
+
+
+def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
+    return dict(
+        server_args=server_args,
+        post_warmup_callback=_tokenizer_worker_gc_callback(
+            worker_id, server_args.gc_threshold
+        ),
+    )
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2488,6 +2643,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
     is_warmup_owner: bool = True,
+    post_warmup_callback: Optional[Callable[[], None]] = None,
 ):
     tokenizer_manager = _global_state.tokenizer_manager
     if not is_warmup_owner:
@@ -2528,6 +2684,8 @@ def _wait_and_warmup(
         else:
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+        if post_warmup_callback is not None:
+            post_warmup_callback()
         _freeze_gc_after_server_warmup(server_args)
 
         # The server is ready for requests
@@ -2610,7 +2768,7 @@ def _run_granian_server(
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
     target = (
-        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+        app if tokenizer_worker_num == 1 else envs.SGLANG_HTTP_SERVER_APP_PATH.get()
     )
     granian_kwargs = dict(
         target=target,
@@ -2886,7 +3044,7 @@ def _setup_and_run_http_server(
                     ),
                 ):
                     uvicorn.run(
-                        "sglang.srt.entrypoints.http_server:app",
+                        envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
                         host=get_serving().host,
                         port=get_serving().port,
                         root_path=get_serving().fastapi_root_path,
