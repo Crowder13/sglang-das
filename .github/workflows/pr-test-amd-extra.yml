@@ -24,6 +24,8 @@ on:
   # No `labeled` trigger, as in pr-test-extra.yml: a label event would cancel
   # the run in progress. Adding the labels after a push takes a rerun.
   pull_request:
+    types:
+      - labeled
   workflow_dispatch:
     inputs:
       runner_arch:
@@ -118,6 +120,7 @@ jobs:
   # every test job via `needs`, so a PR without the labels ends in one red
   # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
   call-gate:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.label.name == 'run-ci'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true

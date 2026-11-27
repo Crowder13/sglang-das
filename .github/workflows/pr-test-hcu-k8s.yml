@@ -295,7 +295,6 @@ jobs:
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: true"
-          echo "Auto run HCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
           echo "============================"
 
       - name: Block draft PR
@@ -304,18 +303,16 @@ jobs:
           echo "PR is draft. Blocking HCU CI."
           exit 1
 
-      - name: Require run-ci label or HCU auto-run
+      # The label is one-shot: ci-label-consume.yml removes it as soon as it
+      # has dispatched CI, so read the label from the event payload instead of
+      # re-fetching the PR. HCU-impact paths no longer auto-start CI -- every
+      # run needs a fresh `run-ci` label.
+      - name: Require run-ci label
         env:
-          AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
-          HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
+          EVENT_LABEL: ${{ github.event.label.name }}
         run: |
-          if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
-            echo "Found run-ci label. Proceeding with HCU CI."
-            exit 0
-          fi
-
-          if [[ "${AUTO_RUN_CI}" == "true" ]]; then
-            echo "Auto-run HCU CI because HCU-impact paths changed."
+          if [[ "${EVENT_LABEL}" == "run-ci" ]]; then
+            echo "run-ci label added; proceeding with HCU CI."
             exit 0
           fi
 

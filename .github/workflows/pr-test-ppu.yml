@@ -5,7 +5,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    types:
+      - labeled
   workflow_dispatch:
     inputs:
       run_all_tests:

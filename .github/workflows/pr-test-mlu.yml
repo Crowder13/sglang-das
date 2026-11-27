@@ -11,7 +11,8 @@ on:
     # `labeled` lets the workflow re-fire when `run-ci-mlu` (or `run-ci`)
     # is added after the latest push. See call-gate.if for the matching guard
     # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
+    types:
+      - labeled
   workflow_dispatch:
     inputs:
       ref:
@@ -31,6 +32,7 @@ concurrency:
 
 jobs:
   check-mlu-opt-in:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ github.event_name != 'pull_request_target' || steps.labels.outputs.enabled == 'true' }}

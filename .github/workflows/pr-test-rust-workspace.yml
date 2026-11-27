@@ -11,7 +11,8 @@ on:
       - ".github/workflows/pr-test-rust-workspace.yml"
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    types:
+      - labeled
     paths:
       - "rust/**"
       - ".github/workflows/pr-test-rust-workspace.yml"

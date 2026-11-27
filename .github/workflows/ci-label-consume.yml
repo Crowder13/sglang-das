@@ -1,0 +1,43 @@
+name: Consume run-ci label
+
+# `run-ci` is a one-shot token. Adding it to a pull request dispatches the PR
+# CI workflows (they now trigger on `labeled` only) and this workflow removes
+# the label again right away, so:
+#   * pushing new commits never starts CI on its own -- only a fresh label does;
+#   * a pull request author cannot park a stale `run-ci` on a fork PR and have
+#     CI re-fire in the base repository on demand.
+#
+# This workflow only calls the issues API; it never checks out or executes pull
+# request code, so the write-scoped token is not reachable by a PR author.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  consume:
+    if: github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Remove run-ci from the pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "No pull request in the event payload; nothing to consume."
+            exit 0
+          fi
+          if gh api --method DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/run-ci" >/dev/null 2>&1; then
+            echo "Removed run-ci from #${PR_NUMBER}. Add it again to start another CI run."
+          else
+            echo "run-ci is already gone from #${PR_NUMBER}; nothing to do."
+          fi

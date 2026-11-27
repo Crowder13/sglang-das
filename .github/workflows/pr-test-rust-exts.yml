@@ -18,7 +18,8 @@ on:
       - ".github/workflows/pr-test-rust-exts.yml"
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    types:
+      - labeled
     paths:
       - "rust/sglang-mm/**"
       - "rust/Cargo.toml"

@@ -19,6 +19,8 @@ on:
   # rerun (/tag-and-rerun-ci extra, or a manual rerun), which the live label
   # gate in pr-gate.yml then passes.
   pull_request:
+    types:
+      - labeled
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -84,6 +86,7 @@ jobs:
   # payload, which never updates on rerun and made the slash-add-label flow
   # impossible to recover.
   check-changes:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.label.name == 'run-ci'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
